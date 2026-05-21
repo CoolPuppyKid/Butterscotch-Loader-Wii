@@ -1,0 +1,29 @@
+{
+    "configurations": [
+        {
+            "name": "Wii",
+            "includePath": [
+                "${workspaceFolder}/src/**",
+                "${workspaceFolder}/vendor/**",
+                "/opt/devkitpro/libogc/include",
+                "/opt/devkitpro/libogc/include/bte",
+                "/opt/devkitpro/libogc/include/wiiuse",
+                "/opt/devkitpro/portlibs/ppc/include",
+                "/opt/devkitpro/devkitPPC/powerpc-eabi/include",
+                "/opt/devkitpro/portlibs/wii/include"
+            ],
+            "defines": [
+                "PLATFORM_WII",
+                "USE_FLOAT_REALS",
+                "NO_RVALUE_INT64",
+                "__wii__",
+                "GEKKO",
+                "IS_BIG_ENDIAN"
+            ],
+            "compilerPath": "/opt/devkitpro/devkitPPC/bin/powerpc-eabi-gcc",
+            "cStandard": "c99",
+            "intelliSenseMode": "gcc-arm"
+        }
+    ],
+    "version": 4
+}
