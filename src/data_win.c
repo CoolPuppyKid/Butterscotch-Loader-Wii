@@ -6,6 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifdef GEKKO
+#include <sys/stat.h>
+#endif
 
 #include "stb_ds.h"
 #include "utils.h"
@@ -1737,7 +1740,7 @@ static void parseSTRG(BinaryReader* reader, DataWin* dw) {
     free(ptrs);
 }
 
-static void parseTXTR(BinaryReader* reader, DataWin* dw, size_t chunkEnd) {
+static void parseTXTR(BinaryReader* reader, DataWin* dw, size_t chunkEnd, bool loadBlobData) {
     Txtr* t = &dw->txtr;
 
     uint32_t count;
@@ -1810,10 +1813,11 @@ static void parseTXTR(BinaryReader* reader, DataWin* dw, size_t chunkEnd) {
         }
     }
 
-    // Load blob data into owned buffers
-    repeat(count, i) {
-        if (t->textures[i].blobOffset == 0 || t->textures[i].blobSize == 0) continue;
-        t->textures[i].blobData = BinaryReader_readBytesAt(reader, t->textures[i].blobOffset, t->textures[i].blobSize);
+    if (loadBlobData) {
+        repeat(count, i) {
+            if (t->textures[i].blobOffset == 0 || t->textures[i].blobSize == 0) continue;
+            t->textures[i].blobData = BinaryReader_readBytesAt(reader, t->textures[i].blobOffset, t->textures[i].blobSize);
+        }
     }
 }
 
@@ -1856,9 +1860,18 @@ DataWin* DataWin_parse(const char* filePath, DataWinParserOptions options) {
     // call would otherwise trigger a separate disc read of just a few sectors
     setvbuf(file, nullptr, _IOFBF, 128 * 1024);
 
-    fseek(file, 0, SEEK_END);
-    long fileSize = ftell(file);
-    fseek(file, 0, SEEK_SET);
+    long fileSize = -1;
+#ifdef GEKKO
+    struct stat fileStat;
+    if (stat(filePath, &fileStat) == 0 && !S_ISDIR(fileStat.st_mode)) {
+        fileSize = (long) fileStat.st_size;
+    }
+#endif
+    if (fileSize <= 0) {
+        fseek(file, 0, SEEK_END);
+        fileSize = ftell(file);
+        fseek(file, 0, SEEK_SET);
+    }
 
     if (fileSize <= 0) {
         fprintf(stderr, "Invalid file size: %ld\n", fileSize);
@@ -1898,6 +1911,10 @@ DataWin* DataWin_parse(const char* filePath, DataWinParserOptions options) {
         BinaryReader_readBytes(&reader, chunkName, 4);
         uint32_t chunkLength = BinaryReader_readUint32(&reader);
         size_t chunkDataStart = BinaryReader_getPosition(&reader);
+
+        if (options.progressCallback) {
+            options.progressCallback(chunkName, totalChunks, 0, dw, options.progressCallbackUserData);
+        }
 
         if (options.parseStrg && memcmp(chunkName, "STRG", 4) == 0) {
             dw->strgBufferBase = chunkDataStart;
@@ -1978,7 +1995,8 @@ DataWin* DataWin_parse(const char* filePath, DataWinParserOptions options) {
 
         // Bulk-read the chunk data into memory for fast parsing
         uint8_t* chunkBuffer = nullptr;
-        if (shouldParse && chunkLength > 0) {
+        bool useChunkBuffer = shouldParse && !(options.lazyLoadTextureData && memcmp(chunkName, "TXTR", 4) == 0);
+        if (useChunkBuffer && chunkLength > 0) {
             chunkBuffer = safeMalloc(chunkLength);
             size_t read = fread(chunkBuffer, 1, chunkLength, reader.file);
             if (read != chunkLength) {
@@ -2049,7 +2067,7 @@ DataWin* DataWin_parse(const char* filePath, DataWinParserOptions options) {
         } else if (options.parseStrg && memcmp(chunkName, "STRG", 4) == 0) {
             parseSTRG(&reader, dw);
         } else if (options.parseTxtr && memcmp(chunkName, "TXTR", 4) == 0) {
-            parseTXTR(&reader, dw, chunkEnd);
+            parseTXTR(&reader, dw, chunkEnd, !options.lazyLoadTextureData);
         } else if (options.parseAudo && memcmp(chunkName, "AUDO", 4) == 0) {
             parseAUDO(&reader, dw);
         } else {
@@ -2076,9 +2094,10 @@ DataWin* DataWin_parse(const char* filePath, DataWinParserOptions options) {
         }
     }
 
-    // If lazy-loading rooms, keep the file handle open for DataWin_loadRoomPayload, otherwise close it now
+    // If lazy-loading rooms or texture blobs, keep the file handle open for on-demand reads.
     dw->lazyLoadRooms = options.lazyLoadRooms;
-    if (options.lazyLoadRooms) {
+    dw->lazyLoadTextureData = options.lazyLoadTextureData;
+    if (options.lazyLoadRooms || options.lazyLoadTextureData) {
         dw->lazyLoadFile = file;
         dw->lazyLoadFilePath = safeStrdup(filePath);
         dw->fileSize = (size_t) fileSize;
@@ -2339,6 +2358,38 @@ void DataWin_loadRoomPayload(DataWin* dw, int32_t roomIndex) {
     FILE* f = dw->lazyLoadFile;
     BinaryReader lazyReader = BinaryReader_create(f, dw->fileSize);
     readRoomPayload(&lazyReader, dw, room);
+}
+
+// ===[ Lazy TXTR Blob Data ]===
+
+bool DataWin_loadTextureBlob(DataWin* dw, uint32_t textureIndex) {
+    requireNotNull(dw);
+    if (textureIndex >= dw->txtr.count || dw->txtr.textures == nullptr)
+        return false;
+
+    Texture* texture = &dw->txtr.textures[textureIndex];
+    if (texture->blobData != nullptr)
+        return true;
+    if (texture->blobOffset == 0 || texture->blobSize == 0)
+        return false;
+
+    requireMessage(dw->lazyLoadFile != nullptr, "DataWin_loadTextureBlob called without an open lazy-load FILE*");
+
+    uint8_t* data = safeMalloc(texture->blobSize);
+    BinaryReader lazyReader = BinaryReader_create(dw->lazyLoadFile, dw->fileSize);
+    BinaryReader_seek(&lazyReader, texture->blobOffset);
+    BinaryReader_readBytes(&lazyReader, data, texture->blobSize);
+    texture->blobData = data;
+    return true;
+}
+
+void DataWin_freeTextureBlob(DataWin* dw, uint32_t textureIndex) {
+    requireNotNull(dw);
+    if (!dw->lazyLoadTextureData || textureIndex >= dw->txtr.count || dw->txtr.textures == nullptr)
+        return;
+
+    free(dw->txtr.textures[textureIndex].blobData);
+    dw->txtr.textures[textureIndex].blobData = nullptr;
 }
 
 // ===[ Dynamic Sprite Slot Allocation ]===

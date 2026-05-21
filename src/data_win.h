@@ -42,6 +42,9 @@ typedef struct {
     // If true, Room payloads (backgrounds, views, gameObjects, tiles, layers) are parsed on demand via DataWin_loadRoomPayload during gameplay.
     bool lazyLoadRooms;
 
+    // If true, TXTR blob data is read on demand via DataWin_loadTextureBlob instead of all being held in RAM after parsing.
+    bool lazyLoadTextureData;
+
     // When lazyLoadRooms is true, this list indicates which rooms should be loaded during load time instead of demand. They will also not be freed.
     StringBooleanEntry* eagerlyLoadedRooms;
 
@@ -845,6 +848,7 @@ typedef struct DataWin {
     char* lazyLoadFilePath; // owned strdup of the original file path, for diagnostics
     size_t fileSize; // cached size of the DataWin, captured at parse time. Used for platforms where fseek(SEEK_END)+ftell is unreliable due to buffering (like the PlayStation 2).
     bool lazyLoadRooms; // mirrors the parser option so Runner can branch without re-reading options
+    bool lazyLoadTextureData; // mirrors the parser option so renderers can avoid keeping all TXTR blobs resident
 } DataWin;
 
 DataWin* DataWin_parse(const char* filePath, DataWinParserOptions options);
@@ -853,6 +857,9 @@ void DataWin_printDebugSummary(DataWin* dataWin);
 // Lazy room payload management. DataWin_loadRoomPayload is a no-op when the payload is already loaded.
 void DataWin_loadRoomPayload(DataWin* dw, int32_t roomIndex);
 void DataWin_freeRoomPayload(Room* room);
+// Lazy TXTR blob management. DataWin_freeTextureBlob is a no-op unless lazyLoadTextureData is enabled.
+bool DataWin_loadTextureBlob(DataWin* dw, uint32_t textureIndex);
+void DataWin_freeTextureBlob(DataWin* dw, uint32_t textureIndex);
 // Finds a reusable dynamic Sprite slot (textureCount == 0) at or above `startIndex`, or appends a new one.
 uint32_t DataWin_allocSpriteSlot(DataWin* dw, uint32_t startIndex);
 // Compares the detected effective GMS version (not the raw GEN8 version) against a lower bound.

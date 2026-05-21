@@ -6,6 +6,9 @@
 #include "utils.h"
 #include "json_writer.h"
 #include "collision.h"
+#ifdef PLATFORM_WII
+#include "wii/grr_renderer.h"
+#endif
 
 #include <stdint.h>
 #include <stdio.h>
@@ -15,6 +18,18 @@
 
 #include "debug_overlay.h"
 #include "stb_ds.h"
+
+#ifdef PLATFORM_WII
+static uint32_t g_wiiDrawEventsThisFrame = 0;
+static uint32_t g_wiiDrawSelfThisFrame = 0;
+static uint32_t g_wiiDrawEventsLastFrame = 0;
+static uint32_t g_wiiDrawSelfLastFrame = 0;
+
+void Runner_wiiGetDrawEventStats(uint32_t* outDrawEvents, uint32_t* outDrawSelf) {
+    if (outDrawEvents) *outDrawEvents = g_wiiDrawEventsLastFrame;
+    if (outDrawSelf) *outDrawSelf = g_wiiDrawSelfLastFrame;
+}
+#endif
 
 // ===[ Runtime Layer Teardown Helpers ]===
 void Runner_freeRuntimeLayer(RuntimeLayer* runtimeLayer) {
@@ -494,6 +509,9 @@ static void fireDrawSubtype(Runner* runner, Drawable* drawables, int32_t drawabl
         int32_t ownerObjectIndex = -1;
         int32_t codeId = ResolvedEventTable_lookup(&runner->eventTable, inst->objectIndex, slot, &ownerObjectIndex);
         if (0 > codeId) continue;
+#ifdef PLATFORM_WII
+        g_wiiDrawEventsThisFrame++;
+#endif
         Runner_executeResolvedEvent(runner, inst, EVENT_DRAW, subtype, codeId, ownerObjectIndex);
     }
 }
@@ -697,8 +715,14 @@ void Runner_draw(Runner* runner) {
             int32_t ownerObjectIndex = -1;
             int32_t codeId = findEventCodeIdAndOwner(runner, inst->objectIndex, EVENT_DRAW, DRAW_NORMAL, &ownerObjectIndex);
             if (codeId >= 0) {
+#ifdef PLATFORM_WII
+                g_wiiDrawEventsThisFrame++;
+#endif
                 Runner_executeResolvedEvent(runner, inst, EVENT_DRAW, DRAW_NORMAL, codeId, ownerObjectIndex);
             } else if (runner->renderer != nullptr) {
+#ifdef PLATFORM_WII
+                g_wiiDrawSelfThisFrame++;
+#endif
                 Renderer_drawSelf(runner->renderer, inst);
             }
         } else if (d->type == DRAWABLE_LAYER)
@@ -890,6 +914,10 @@ void Runner_computeViewDisplayScale(Runner* runner, int32_t gameW, int32_t gameH
 }
 
 void Runner_drawViews(Runner* runner, int32_t gameW, int32_t gameH, float displayScaleX, float displayScaleY, bool debugShowCollisionMasks) {
+#ifdef PLATFORM_WII
+    g_wiiDrawEventsThisFrame = 0;
+    g_wiiDrawSelfThisFrame = 0;
+#endif
     Renderer* renderer = runner->renderer;
     Room* activeRoom = runner->currentRoom;
     bool anyViewRendered = false;
@@ -949,6 +977,10 @@ void Runner_drawViews(Runner* runner, int32_t gameW, int32_t gameH, float displa
 
     // Reset view_current to 0 so non-Draw events (Step, Alarm, Create) see view_current = 0
     runner->viewCurrent = 0;
+#ifdef PLATFORM_WII
+    g_wiiDrawEventsLastFrame = g_wiiDrawEventsThisFrame;
+    g_wiiDrawSelfLastFrame = g_wiiDrawSelfThisFrame;
+#endif
 }
 
 // ===[ Instance Creation Helper ]===
@@ -1072,6 +1104,10 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
     if (!room->payloadLoaded) {
         DataWin_loadRoomPayload(dataWin, roomIndex);
     }
+
+#ifdef PLATFORM_WII
+    GRRRenderer_preloadRoomAssets(runner->renderer, dataWin, roomIndex);
+#endif
 
     SavedRoomState* savedState = &runner->savedRoomStates[roomIndex];
 
@@ -1838,11 +1874,19 @@ void Runner_initFirstRoom(Runner* runner) {
     repeat(dataWin->glob.count, i) {
         int32_t codeId = dataWin->glob.codeIds[i];
         if (codeId >= 0 && dataWin->code.count > (uint32_t) codeId) {
+#ifdef PLATFORM_WII
+            char status[128];
+            snprintf(status, sizeof(status), "SCRIPT %s", dataWin->code.entries[codeId].name ? dataWin->code.entries[codeId].name : "(unnamed)");
+            WiiGX_drawLoadingStatus((int)i, (int)dataWin->glob.count, status);
+#endif
             fprintf(stderr, "Runner: Executing global init script: %s\n", dataWin->code.entries[codeId].name);
             RValue result = VM_executeCode(runner->vmContext, codeId);
             RValue_free(&result);
         }
     }
+#ifdef PLATFORM_WII
+    if (dataWin->glob.count > 0) WiiGX_drawLoadingStatus((int)dataWin->glob.count, (int)dataWin->glob.count, "SCRIPTS READY");
+#endif
     runner->vmContext->currentInstance = nullptr;
 
     // Initialize the first room
