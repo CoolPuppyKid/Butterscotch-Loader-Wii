@@ -1,0 +1,26 @@
+{
+    "version": 3,
+    "configurePresets": [
+        {
+            "name": "wii",
+            "displayName": "Wii",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build/wii",
+            "toolchainFile": "${sourceDir}/cmake/wii.cmake",
+            "cacheVariables": {
+                "PLATFORM": "wii",
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "glfw-linux",
+            "displayName": "GLFW (Linux)",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build/glfw",
+            "cacheVariables": {
+                "PLATFORM": "glfw",
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        }
+    ]
+}

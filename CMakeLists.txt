@@ -459,6 +459,50 @@ elseif(PLATFORM STREQUAL "ps3")
     find_package(SDL2 REQUIRED)
     target_include_directories(butterscotch PRIVATE ${SDL2_INCLUDE_DIRS})
     target_link_libraries(butterscotch PRIVATE ${SDL2_LIBRARIES} m gcm_sys rsx sysutil io audio rt lv2 io audio bz2)
+elseif(PLATFORM STREQUAL "wii")
+    file(GLOB IMAGE_SOURCES src/image/*.c)
+    target_sources(butterscotch PRIVATE ${IMAGE_SOURCES})
+
+    add_compile_definitions(PLATFORM_WII)
+    add_compile_definitions(USE_FLOAT_REALS)
+    add_compile_definitions(NO_RVALUE_INT64)
+
+    # stb_image
+    target_include_directories(butterscotch PUBLIC vendor/stb/image)
+    # stb_vorbis
+    target_include_directories(butterscotch PUBLIC vendor/stb/vorbis)
+
+    target_compile_options(butterscotch PRIVATE
+        -mrvl -mcpu=750 -meabi -mhard-float
+        -fsingle-precision-constant -Werror=double-promotion
+        -fomit-frame-pointer -ffast-math
+    )
+
+    target_include_directories(butterscotch PRIVATE
+        $ENV{DEVKITPRO}/libogc/include
+        $ENV{DEVKITPRO}/portlibs/ppc/include
+        $ENV{DEVKITPRO}/portlibs/wii/include
+        ${CMAKE_SOURCE_DIR}/src/image
+    )
+    target_link_directories(butterscotch PRIVATE
+        $ENV{DEVKITPRO}/libogc/lib/wii
+        $ENV{DEVKITPRO}/portlibs/ppc/lib
+        $ENV{DEVKITPRO}/portlibs/wii/lib
+        $ENV{DEVKITPRO}/portlibs/wii/lib/lib
+    )
+    target_link_libraries(butterscotch wiikeyboard wiiuse bte fat asnd ogc m bz2)
+    target_compile_definitions(butterscotch PRIVATE IS_BIG_ENDIAN=1)
+    target_compile_definitions(butterscotch PRIVATE GEKKO)
+
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-unused-variable -Wno-unused-parameter -Wno-unused-function")
+
+    # Generate .dol from ELF
+    add_custom_command(TARGET butterscotch POST_BUILD
+        COMMAND $ENV{DEVKITPRO}/tools/bin/elf2dol
+            $<TARGET_FILE:butterscotch>
+            $<TARGET_FILE_DIR:butterscotch>/butterscotch.dol
+        COMMENT "Converting ELF to DOL"
+    )
 else()
     message(FATAL_ERROR "Unknown platform! ${PLATFORM}")
 endif()
