@@ -58,6 +58,11 @@ static bool pathExists(const char* fullPath) {
 static char* resolveForRead(OverlayFileSystem* ofs, const char* relativePath) {
     char* normalized = normalizePath(relativePath);
     if (isAbsolute(normalized)) return normalized;
+
+    // Check if the path is already resolved
+    if (strncmp(normalized, ofs->savePath, strlen(ofs->savePath)) == 0) return normalized;
+    if (strncmp(normalized, ofs->bundlePath, strlen(ofs->bundlePath)) == 0) return normalized;
+
     char* saveFull = joinPath(ofs->savePath, normalized);
     if (pathExists(saveFull)) {
         free(normalized);
@@ -74,6 +79,11 @@ static char* resolveForRead(OverlayFileSystem* ofs, const char* relativePath) {
 static char* resolveForWrite(OverlayFileSystem* ofs, const char* relativePath) {
     char* normalized = normalizePath(relativePath);
     if (isAbsolute(normalized)) return normalized;
+
+    // Check if the path is already resolved
+    if (strncmp(normalized, ofs->savePath, strlen(ofs->savePath)) == 0) return normalized;
+    if (strncmp(normalized, ofs->bundlePath, strlen(ofs->bundlePath)) == 0) return normalized;
+
     char* full = joinPath(ofs->savePath, normalized);
     free(normalized);
     return full;
@@ -106,30 +116,20 @@ static char* overlayResolvePath(FileSystem* fs, const char* relativePath) {
     OverlayFileSystem* ofs = (OverlayFileSystem*) fs;
     char* normalized = normalizePath(relativePath);
     if (isAbsolute(normalized)) return normalized;
+
+    // Check if the path is already resolved
+    if (strncmp(normalized, ofs->savePath, strlen(ofs->savePath)) == 0) return normalized;
+    if (strncmp(normalized, ofs->bundlePath, strlen(ofs->bundlePath)) == 0) return normalized;
+
     char* full = joinPath(ofs->bundlePath, normalized);
     free(normalized);
     return full;
 }
 
 static bool overlayFileExists(FileSystem* fs, const char* relativePath) {
-    OverlayFileSystem* ofs = (OverlayFileSystem*) fs;
-    char* normalized = normalizePath(relativePath);
-    if (isAbsolute(normalized)) {
-        bool exists = pathExists(normalized);
-        free(normalized);
-        return exists;
-    }
-    char* saveFull = joinPath(ofs->savePath, normalized);
-    if (pathExists(saveFull)) {
-        free(saveFull);
-        free(normalized);
-        return true;
-    }
-    free(saveFull);
-    char* bundleFull = joinPath(ofs->bundlePath, normalized);
-    bool exists = pathExists(bundleFull);
-    free(bundleFull);
-    free(normalized);
+    char* fullPath = resolveForRead((OverlayFileSystem*) fs, relativePath);
+    bool exists = pathExists(fullPath);
+    free(fullPath);
     return exists;
 }
 
@@ -201,6 +201,94 @@ static bool overlayWriteFileBinary(FileSystem* fs, const char* relativePath, con
     return written == (size_t) size;
 }
 
+// ===[ Streaming Binary I/O ]===
+// Handle wraps the FILE* plus the resolved on-disk path
+
+typedef struct {
+    FILE* fp;
+    char* fullPath; // already-resolved absolute path used at open time
+} OverlayBinaryHandle;
+
+static OverlayBinaryHandle* overlayBinaryHandleNew(FILE* fp, char* fullPathTaken) {
+    OverlayBinaryHandle* h = safeMalloc(sizeof(OverlayBinaryHandle));
+    h->fp = fp;
+    h->fullPath = fullPathTaken; // takes ownership
+    return h;
+}
+
+static void* overlayBinaryOpen(FileSystem* fs, const char* relativePath, int32_t mode) {
+    OverlayFileSystem* ofs = (OverlayFileSystem*) fs;
+    if (mode == GML_FILE_BIN_READ) {
+        char* path = resolveForRead(ofs, relativePath);
+        FILE* f = fopen(path, "rb");
+        if (f == nullptr) { free(path); return nullptr; }
+        return overlayBinaryHandleNew(f, path);
+    }
+    if (mode == GML_FILE_BIN_WRITE) {
+        char* path = resolveForWrite(ofs, relativePath);
+        ensureParentDir(path);
+        FILE* f = fopen(path, "wb");
+        if (f == nullptr) { free(path); return nullptr; }
+        return overlayBinaryHandleNew(f, path);
+    }
+    // GML_FILE_BIN_READWRITE: preserve existing contents
+    char* readPath = resolveForRead(ofs, relativePath);
+    FILE* f = fopen(readPath, "r+b");
+    if (f != nullptr) return overlayBinaryHandleNew(f, readPath);
+    free(readPath);
+    char* writePath = resolveForWrite(ofs, relativePath);
+    ensureParentDir(writePath);
+    f = fopen(writePath, "w+b");
+    if (f == nullptr) { free(writePath); return nullptr; }
+    return overlayBinaryHandleNew(f, writePath);
+}
+
+static void overlayBinaryClose(MAYBE_UNUSED FileSystem* fs, void* handle) {
+    if (handle == nullptr) return;
+    OverlayBinaryHandle* h = (OverlayBinaryHandle*) handle;
+    if (h->fp != nullptr) fclose(h->fp);
+    free(h->fullPath);
+    free(h);
+}
+
+static int32_t overlayBinaryRead(MAYBE_UNUSED FileSystem* fs, void* handle, void* dst, int32_t n) {
+    if (handle == nullptr || 0 >= n) return 0;
+    return (int32_t) fread(dst, 1, (size_t) n, ((OverlayBinaryHandle*) handle)->fp);
+}
+
+static int32_t overlayBinaryWrite(MAYBE_UNUSED FileSystem* fs, void* handle, const void* src, int32_t n) {
+    if (handle == nullptr || 0 >= n) return 0;
+    return (int32_t) fwrite(src, 1, (size_t) n, ((OverlayBinaryHandle*) handle)->fp);
+}
+
+static int32_t overlayBinaryTell(MAYBE_UNUSED FileSystem* fs, void* handle) {
+    if (handle == nullptr) return 0;
+    return (int32_t) ftell(((OverlayBinaryHandle*) handle)->fp);
+}
+
+static bool overlayBinarySeek(MAYBE_UNUSED FileSystem* fs, void* handle, int32_t pos) {
+    if (handle == nullptr) return false;
+    return fseek(((OverlayBinaryHandle*) handle)->fp, pos, SEEK_SET) == 0;
+}
+
+static int32_t overlayBinarySize(MAYBE_UNUSED FileSystem* fs, void* handle) {
+    if (handle == nullptr) return 0;
+    FILE* f = ((OverlayBinaryHandle*) handle)->fp;
+    long saved = ftell(f);
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, saved, SEEK_SET);
+    return (int32_t) size;
+}
+
+static void overlayBinaryRewrite(MAYBE_UNUSED FileSystem* fs, void* handle) {
+    if (handle == nullptr) return;
+    OverlayBinaryHandle* h = (OverlayBinaryHandle*) handle;
+    if (h->fp != nullptr) fclose(h->fp);
+    // "wb+" truncates the existing file (or creates it if it vanished since open) and gives back read+write
+    h->fp = fopen(h->fullPath, "wb+");
+}
+
 // ===[ Vtable ]===
 
 static FileSystemVtable overlayFileSystemVtable = {
@@ -211,6 +299,14 @@ static FileSystemVtable overlayFileSystemVtable = {
     .deleteFile = overlayDeleteFile,
     .readFileBinary = overlayReadFileBinary,
     .writeFileBinary = overlayWriteFileBinary,
+    .binaryOpen = overlayBinaryOpen,
+    .binaryClose = overlayBinaryClose,
+    .binaryRead = overlayBinaryRead,
+    .binaryWrite = overlayBinaryWrite,
+    .binaryTell = overlayBinaryTell,
+    .binarySeek = overlayBinarySeek,
+    .binarySize = overlayBinarySize,
+    .binaryRewrite = overlayBinaryRewrite,
 };
 
 // ===[ Lifecycle ]===

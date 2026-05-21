@@ -26,8 +26,10 @@ Butterscotch's goal is to be able to have Undertale v1.08 (GameMaker: Studio 1.4
 
 While our target is Undertale v1.08, that doesn't mean that other games CAN'T run in Butterscotch! Because Butterscotch is a runner and not a Undertale port/remake, you CAN run other GameMaker: Studio games with it and, as long as the game is compiled with GameMaker: Studio 1.4.1804 and they only use GML variables and functions that Butterscotch supports, it should work fine.
 
-Here are the Bytecode Versions that Butterscotch supports
+Butterscotch supports the following bytecode versions:
 
+* Bytecode Version 13
+* Bytecode Version 14
 * Bytecode Version 15
 * Bytecode Version 16
 * Bytecode Version 17
@@ -181,3 +183,16 @@ Here's a video :3 https://youtu.be/c9r79sQABYg
 ### DELTARUNE Chapter Selector (GLFW) [Bytecode Version 17]
 
 <img width="160" height="120" alt="image" src="https://github.com/user-attachments/assets/b8a848df-fd1c-49b7-9602-e8020ac86d5d" />
+
+### Undertale 10th Anniversary (GLFW) [Bytecode Version 17]
+
+<img width="160" height="120" alt="image" src="https://github.com/user-attachments/assets/4ec0c64e-23f1-4bb1-8291-6aaf626a690f" />
+<img width="160" height="120" alt="image" src="https://github.com/user-attachments/assets/4ea7d078-784d-4861-aeb1-4ee2d1d70508" />
+<img width="160" height="120" alt="image" src="https://github.com/user-attachments/assets/45eb5be9-5e7b-4930-bb7e-2f2c49c76a49" />
+
+### AM2R (GLFW) [Bytecode Version 14]
+
+<img width="160" alt="image" src="https://github.com/user-attachments/assets/3e46dfed-487c-4d91-9cd5-c71adc7a6cb5" />
+<img width="160" alt="image" src="https://github.com/user-attachments/assets/4a4b6da1-dae4-4d0f-8611-12e7a1fc8d8c" />
+<img width="160" alt="image" src="https://github.com/user-attachments/assets/d522be68-1003-4208-bf6b-d59a004606ba" />
+

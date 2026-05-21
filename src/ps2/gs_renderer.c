@@ -23,7 +23,6 @@
 // ===[ Constants ]===
 #define PS2_SCREEN_WIDTH 640.0f
 #define PS2_SCREEN_HEIGHT 448.0f
-#define TEX_HEADER_SIZE 128
 #define CLUT4_ENTRY_SIZE 64    // 16 colors * 4 bytes
 #define CLUT8_ENTRY_SIZE 1024  // 256 colors * 4 bytes
 
@@ -85,10 +84,24 @@ static void loadAtlas(GsRenderer* gs) {
     gs->atlasTileCount = BinaryReader_readUint16(&reader);
     gs->atlasCount = BinaryReader_readUint16(&reader);
 
-    // Parse atlas offset table
+    // Parse atlas table
     gs->atlasOffsets = safeMalloc(gs->atlasCount * sizeof(uint32_t));
+    gs->atlasWidth = safeMalloc(gs->atlasCount * sizeof(uint16_t));
+    gs->atlasHeight = safeMalloc(gs->atlasCount * sizeof(uint16_t));
+    gs->atlasBpp = safeMalloc(gs->atlasCount * sizeof(uint8_t));
+    gs->atlasDataSizes = safeMalloc(gs->atlasCount * sizeof(uint32_t));
+    gs->atlasCompressionType = safeMalloc(gs->atlasCount * sizeof(uint8_t));
     repeat(gs->atlasCount, i) {
         gs->atlasOffsets[i] = BinaryReader_readUint32(&reader);
+        gs->atlasWidth[i] = BinaryReader_readUint16(&reader);
+        gs->atlasHeight[i] = BinaryReader_readUint16(&reader);
+        gs->atlasBpp[i] = BinaryReader_readUint8(&reader);
+        gs->atlasDataSizes[i] = BinaryReader_readUint32(&reader);
+        gs->atlasCompressionType[i] = BinaryReader_readUint8(&reader);
+        if (gs->atlasBpp[i] != 4 && gs->atlasBpp[i] != 8) {
+            fprintf(stderr, "GsRenderer: Atlas %u has unsupported bpp %u\n", i, gs->atlasBpp[i]);
+            abort();
+        }
     }
 
     // Parse TPAG entries
@@ -140,9 +153,6 @@ static void loadAtlas(GsRenderer* gs) {
         hmput(gs->tileEntryMap, key, entry);
     }
 
-    gs->atlasBpp = safeCalloc(gs->atlasCount, sizeof(uint8_t));
-    gs->atlasWidth = safeCalloc(gs->atlasCount, sizeof(uint16_t));
-    gs->atlasHeight = safeCalloc(gs->atlasCount, sizeof(uint16_t));
     gs->atlasToChunk = safeMalloc(gs->atlasCount * sizeof(int16_t));
     repeat(gs->atlasCount, i) {
         gs->atlasToChunk[i] = -1;
@@ -229,47 +239,56 @@ static void loadAndUploadCLUTs(GsRenderer* gs) {
 // Manages a pool of 128KB VRAM chunks for atlas textures.
 // 4bpp atlases use 1 chunk, 8bpp atlases use 2 consecutive chunks.
 
-#define FONTM_RESERVED_VRAM 65536 // 64KB reserved for gsKit's TexManager (FONTM debug overlay)
-
-// Initializes the chunk pool from the remaining VRAM after CLUTs.
-// Reserves 64KB at the end for gsKit's TexManager (used by FONTM).
-// Our chunk pool occupies the middle, between CLUTs and the FONTM region.
+// Initializes the chunk pool from the remaining VRAM after framebuffers + CLUTs + Debug Font.
 //
-// VRAM layout: [Framebuffers] [CLUTs] [Chunk Pool ...] [64KB FONTM]
+// VRAM layout: [Framebuffers] [Debug Font atlas + CLUT] [CLUTs] [Chunk Pool ...]
 static void initTextureCache(GsRenderer* gs) {
-    gs->textureVramBase = gs->gsGlobal->CurrentPointer;
-    uint32_t availableVram = GS_VRAM_SIZE - gs->textureVramBase - FONTM_RESERVED_VRAM;
+    // GS FRAME register's FBP is in 8192-byte page units, so a surface used as a render target needs its VRAM address page-aligned.
+    // VRAM_CHUNK_SIZE is a multiple of 8192, so chunk starts are page-aligned if textureVramBase is.
+    uint32_t base = gs->gsGlobal->CurrentPointer;
+    base = (base + 8191u) & ~8191u;
+    gs->textureVramBase = base;
+    gs->gsGlobal->CurrentPointer = base;
+
+    uint32_t availableVram = GS_VRAM_SIZE - gs->textureVramBase;
     gs->chunkCount = availableVram / VRAM_CHUNK_SIZE;
 
     gs->chunks = safeMalloc(gs->chunkCount * sizeof(VRAMChunk));
     forEach(VRAMChunk, chunk, gs->chunks, gs->chunkCount) {
         chunk->atlasId = -1;
+        chunk->snapshotIdx = -1;
+        chunk->surfaceIdx = -1;
         chunk->lastUsed = 0;
     }
 
     gs->frameCounter = 1;
 
-    // Advance CurrentPointer past our chunk pool so the TexManager only
-    // manages the 64KB FONTM region at the end of VRAM.
+    // Advance CurrentPointer past our chunk pool so any future gsKit allocations fail loudly.
     gs->gsGlobal->CurrentPointer = gs->textureVramBase + gs->chunkCount * VRAM_CHUNK_SIZE;
-    gsKit_TexManager_init(gs->gsGlobal);
 
-    uint32_t fontmVram = GS_VRAM_SIZE - gs->gsGlobal->CurrentPointer;
-    fprintf(stderr, "GsRenderer: Texture cache initialized - %u chunks (%u KB each), base 0x%08X, %u KB for textures, %u KB for FONTM\n", gs->chunkCount, VRAM_CHUNK_SIZE / 1024, gs->textureVramBase, gs->chunkCount * (VRAM_CHUNK_SIZE / 1024), fontmVram / 1024);
+    fprintf(stderr, "GsRenderer: Texture cache initialized - %u chunks (%u KB each), base 0x%08X, %u KB for textures\n", gs->chunkCount, VRAM_CHUNK_SIZE / 1024, gs->textureVramBase, gs->chunkCount * (VRAM_CHUNK_SIZE / 1024));
+}
+
+// A chunk is free if no atlas, snapshot, or surface occupies it. Snapshots and surfaces both pin the chunk against LRU eviction.
+static inline bool chunkIsFree(const VRAMChunk* chunk) {
+    return 0 > chunk->atlasId && 0 > chunk->snapshotIdx && 0 > chunk->surfaceIdx;
 }
 
 // Find the first run of consecutive free chunks.
 // Returns the index of the first chunk, or -1 if not found.
-static int32_t findConsecutiveFreeChunks(GsRenderer* gs, int chunksNeeded) {
+static int32_t findConsecutiveFreeChunks(GsRenderer* gs, int chunksNeeded, uint32_t startIdx) {
     int consecutive = 0;
-    forEachIndexed(VRAMChunk, chunk, i, gs->chunks, gs->chunkCount) {
-        if (0 > chunk->atlasId) {
-            consecutive++;
-            if (consecutive >= chunksNeeded) {
-                return (int32_t) (i - (uint32_t) chunksNeeded + 1);
+    if (gs->chunkCount > startIdx) {
+        for (uint32_t i = startIdx; gs->chunkCount > i; i++) {
+            VRAMChunk* chunk = &gs->chunks[i];
+            if (chunkIsFree(chunk)) {
+                consecutive++;
+                if (consecutive >= chunksNeeded) {
+                    return (int32_t) (i - (uint32_t) chunksNeeded + 1);
+                }
+            } else {
+                consecutive = 0;
             }
-        } else {
-            consecutive = 0;
         }
     }
     return -1;
@@ -279,7 +298,7 @@ static int32_t findConsecutiveFreeChunks(GsRenderer* gs, int chunksNeeded) {
 static uint32_t countFreeChunks(GsRenderer* gs) {
     uint32_t count = 0;
     forEach(VRAMChunk, chunk, gs->chunks, gs->chunkCount) {
-        if (0 > chunk->atlasId)
+        if (chunkIsFree(chunk))
             count++;
     }
     return count;
@@ -320,10 +339,13 @@ static void evictAtlas(GsRenderer* gs, int16_t atlasId) {
 
 // Defragment the texture cache by evicting all loaded atlases.
 // They will be reloaded on-demand as needed during subsequent draw calls.
+// Pinned snapshot chunks are NOT touched - their VRAM contents are the only copy and we cannot reload them.
 static void defragTextureCache(GsRenderer* gs) {
     rendererPrintf("GsRenderer: Defragmenting VRAM texture cache...\n");
 
     forEach(VRAMChunk, chunk, gs->chunks, gs->chunkCount) {
+        if (chunk->snapshotIdx >= 0) continue; // pinned snapshot, cannot be discarded
+        if (chunk->surfaceIdx >= 0) continue;  // pinned surface, ditto
         chunk->atlasId = -1;
         chunk->lastUsed = 0;
     }
@@ -332,14 +354,16 @@ static void defragTextureCache(GsRenderer* gs) {
         gs->atlasToChunk[i] = -1;
     }
 
-    rendererPrintf("GsRenderer: Defrag complete - all %u chunks freed\n", gs->chunkCount);
+    rendererPrintf("GsRenderer: Defrag complete - free chunks = %u\n", countFreeChunks(gs));
 }
 
-// Allocate consecutive chunks for an atlas. Evicts LRU victims or defrags if needed.
+// Allocate consecutive chunks. Evicts LRU atlas victims or defrags if needed.
+// startIdx restricts the scan to [startIdx, chunkCount); snapshot callers pass
+// reservedAtlasChunks so the reserved fail-safe region stays atlas-only.
 // Returns the first chunk index, or -1 if VRAM is truly exhausted.
-static int32_t allocateChunks(GsRenderer* gs, int chunksNeeded) {
+static int32_t allocateChunks(GsRenderer* gs, int chunksNeeded, uint32_t startIdx) {
     // Attempt 1: find free consecutive chunks
-    int32_t idx = findConsecutiveFreeChunks(gs, chunksNeeded);
+    int32_t idx = findConsecutiveFreeChunks(gs, chunksNeeded, startIdx);
     if (idx >= 0) return idx;
 
     // Attempt 2: evict LRU victims one at a time until space is found
@@ -360,7 +384,7 @@ static int32_t allocateChunks(GsRenderer* gs, int chunksNeeded) {
 
         evictAtlas(gs, victim);
 
-        idx = findConsecutiveFreeChunks(gs, chunksNeeded);
+        idx = findConsecutiveFreeChunks(gs, chunksNeeded, startIdx);
 
         if (idx >= 0)
             return idx;
@@ -375,7 +399,7 @@ static int32_t allocateChunks(GsRenderer* gs, int chunksNeeded) {
     // Handles fragmentation where enough free chunks exist but aren't consecutive
     if (countFreeChunks(gs) >= (uint32_t) chunksNeeded) {
         defragTextureCache(gs);
-        idx = findConsecutiveFreeChunks(gs, chunksNeeded);
+        idx = findConsecutiveFreeChunks(gs, chunksNeeded, startIdx);
 
         if (idx >= 0)
             return idx;
@@ -395,50 +419,23 @@ static uint32_t atlasUncompressedSize(uint16_t width, uint16_t height, uint8_t b
     return (bpp == 4) ? (width * height / 2) : (width * height);
 }
 
-// Decompress atlas pixel data from a compressed buffer (TEX_HEADER_SIZE header + RLE/raw payload).
+// Decompress atlas pixel data from a payload buffer.
 // Writes uncompressed indexed pixels into outBuf (must be large enough and 128-byte aligned).
-static void decompressAtlasPixels(const uint8_t* compressedData, uint8_t* outBuf) {
-    uint16_t width = BinaryUtils_readUint16(compressedData + 1);
-    uint16_t height = BinaryUtils_readUint16(compressedData + 3);
-    uint8_t bpp = BinaryUtils_readUint8(compressedData + 5);
-    uint32_t pixelDataSize = BinaryUtils_readUint32(compressedData + 6);
-    uint8_t compressionType = BinaryUtils_readUint8(compressedData + 10);
-
+static void decompressAtlasPixels(const uint8_t* pixelData, uint32_t pixelDataSize, uint8_t compressionType, uint16_t width, uint16_t height, uint8_t bpp, uint8_t* outBuf) {
     uint32_t uncompressedSize = (bpp == 4) ? (uint32_t) ((width * height + 1) / 2) : (uint32_t) (width * height);
-    const uint8_t* rawData = compressedData + TEX_HEADER_SIZE;
 
     if (compressionType == 1) {
         // RLE decompression
         uint32_t srcPos = 0, dstPos = 0;
         while (pixelDataSize > srcPos + 1 && uncompressedSize > dstPos) {
-            uint8_t runLength = rawData[srcPos++];
-            uint8_t value = rawData[srcPos++];
+            uint8_t runLength = pixelData[srcPos++];
+            uint8_t value = pixelData[srcPos++];
             for (uint8_t j = 0; runLength > j && uncompressedSize > dstPos; j++) {
                 outBuf[dstPos++] = value;
             }
         }
     } else {
-        memcpy(outBuf, rawData, uncompressedSize);
-    }
-}
-
-// Read each atlas's per-page header from TEXTURES.BIN to populate metadata information.
-static void loadAtlasMetadata(GsRenderer* gs) {
-    uint8_t header[6];
-    repeat(gs->atlasCount, i) {
-        fseek(gs->texturesFile, (long) gs->atlasOffsets[i], SEEK_SET);
-        size_t read = fread(header, 1, sizeof(header), gs->texturesFile);
-        if (read != sizeof(header)) {
-            fprintf(stderr, "GsRenderer: Short read on atlas %u header\n", i);
-            abort();
-        }
-        gs->atlasWidth[i] = BinaryUtils_readUint16(header + 1);
-        gs->atlasHeight[i] = BinaryUtils_readUint16(header + 3);
-        gs->atlasBpp[i] = header[5];
-        if (gs->atlasBpp[i] != 4 && gs->atlasBpp[i] != 8) {
-            fprintf(stderr, "GsRenderer: Atlas %u has unsupported bpp %u\n", i, gs->atlasBpp[i]);
-            abort();
-        }
+        memcpy(outBuf, pixelData, uncompressedSize);
     }
 }
 
@@ -446,6 +443,19 @@ static void loadAtlasMetadata(GsRenderer* gs) {
 static int atlasChunkCount(uint16_t width, uint16_t height, uint8_t bpp) {
     uint32_t bytes = atlasUncompressedSize(width, height, bpp);
     return (int) ((bytes + VRAM_CHUNK_SIZE - 1) / VRAM_CHUNK_SIZE);
+}
+
+// As a fail-safe, we'll reserve the first N chunks for atlases only, to avoid sprite snapshots pinning all chunks.
+static void computeAtlasReservation(GsRenderer* gs) {
+    uint32_t worst = 0;
+    repeat(gs->atlasCount, i) {
+        uint32_t need = (uint32_t) atlasChunkCount(gs->atlasWidth[i], gs->atlasHeight[i], 8);
+        if (need > worst)
+            worst = need;
+    }
+    if (worst > gs->chunkCount) worst = gs->chunkCount;
+    gs->reservedAtlasChunks = worst;
+    fprintf(stderr, "GsRenderer: Reserving first %u chunk(s) (%u KB) as atlas-only fail-safe (largest atlas @ 8bpp)\n", worst, worst * (VRAM_CHUNK_SIZE / 1024));
 }
 
 // Initialize the EE RAM cache. Called from gsInit after opening TEXTURES.BIN.
@@ -461,68 +471,6 @@ static void initEeCache(GsRenderer* gs) {
         gs->eeCacheEntries[i].size = 0;
         gs->eeCacheEntries[i].lastUsed = 0;
     }
-
-    // Compute on-disk sizes from offset table
-    gs->atlasDataSizes = safeMalloc(gs->atlasCount * sizeof(uint32_t));
-
-    // Get total file size for the last atlas
-    fseek(gs->texturesFile, 0, SEEK_END);
-    uint32_t texturesFileSize = (uint32_t) ftell(gs->texturesFile);
-
-    repeat(gs->atlasCount, i) {
-        if (gs->atlasCount - 1 > i) {
-            gs->atlasDataSizes[i] = gs->atlasOffsets[i + 1] - gs->atlasOffsets[i];
-        } else {
-            gs->atlasDataSizes[i] = texturesFileSize - gs->atlasOffsets[i];
-        }
-    }
-}
-
-// Preload atlases sequentially into the EE cache until the buffer is full.
-// Reads compressed data from disc, decompresses, and stores uncompressed pixels in the cache.
-static void preloadEeCache(GsRenderer* gs) {
-    uint32_t preloaded = 0;
-
-    // Allocate a temp buffer for reading compressed data from disc
-    uint32_t maxDiskSize = 0;
-    repeat(gs->atlasCount, i) {
-        if (gs->atlasDataSizes[i] > maxDiskSize) maxDiskSize = gs->atlasDataSizes[i];
-    }
-    uint8_t* tempBuf = (uint8_t*) safeMemalign(128, maxDiskSize);
-
-    repeat(gs->atlasCount, i) {
-        uint8_t bpp = gs->atlasBpp[i];
-        uint16_t width = gs->atlasWidth[i];
-        uint16_t height = gs->atlasHeight[i];
-        uint32_t uncompSize = atlasUncompressedSize(width, height, bpp);
-        if (gs->eeCacheBumpPtr + uncompSize > gs->eeCacheCapacity) {
-            break;
-        }
-
-        // Read compressed data from disc into temp buffer
-        uint32_t dataSize = gs->atlasDataSizes[i];
-        fseek(gs->texturesFile, (long) gs->atlasOffsets[i], SEEK_SET);
-        size_t bytesRead = fread(tempBuf, 1, dataSize, gs->texturesFile);
-        if (bytesRead != dataSize) {
-            fprintf(stderr, "GsRenderer: EE cache preload short read for atlas %u (expected %u, got %zu)\n", i, dataSize, bytesRead);
-            break;
-        }
-
-        // Decompress directly into the EE cache
-        decompressAtlasPixels(tempBuf, gs->eeCache + gs->eeCacheBumpPtr);
-
-        gs->eeCacheEntries[i].atlasId = (int16_t) i;
-        gs->eeCacheEntries[i].offset = gs->eeCacheBumpPtr;
-        gs->eeCacheEntries[i].size = uncompSize;
-        gs->eeCacheEntries[i].lastUsed = gs->frameCounter;
-
-        gs->eeCacheBumpPtr += uncompSize;
-        preloaded++;
-    }
-
-    free(tempBuf);
-
-    fprintf(stderr, "GsRenderer: EE cache initialized - %u MB, %u atlases preloaded (%u KB used)\n", EE_CACHE_CAPACITY / (1024 * 1024), preloaded, gs->eeCacheBumpPtr / 1024);
 }
 
 // Look up an atlas in the EE cache. Returns pointer to cached data or nullptr.
@@ -637,7 +585,7 @@ static void uploadAtlasToChunk(GsRenderer* gs, uint16_t atlasId, int32_t firstCh
     const char* atlasSource = "RAM";
 
     if (uploadData == nullptr) {
-        // Cache miss: read compressed data from TEXTURES.BIN and decompress
+        // Cache miss: read pixel data from TEXTURES.BIN and decompress (if RLE'd)
         uint32_t dataSize = gs->atlasDataSizes[atlasId];
         uint8_t* compressedBuf = (uint8_t*) safeMemalign(128, dataSize);
 
@@ -653,7 +601,7 @@ static void uploadAtlasToChunk(GsRenderer* gs, uint16_t atlasId, int32_t firstCh
         uint16_t height = gs->atlasHeight[atlasId];
         uint32_t uncompSize = atlasUncompressedSize(width, height, bpp);
         tempPixelData = (uint8_t*) safeMemalign(128, uncompSize);
-        decompressAtlasPixels(compressedBuf, tempPixelData);
+        decompressAtlasPixels(compressedBuf, dataSize, gs->atlasCompressionType[atlasId], width, height, bpp, tempPixelData);
         free(compressedBuf);
 
         // Try to insert uncompressed data into EE cache
@@ -671,6 +619,8 @@ static void uploadAtlasToChunk(GsRenderer* gs, uint16_t atlasId, int32_t firstCh
             rendererPrintf("GsRenderer: EE cache insert failed for atlas %u, uploading directly\n", atlasId);
             uploadData = tempPixelData;
         }
+    } else {
+        gs->ramLoadsThisFrame++;
     }
 
     // Upload pixel data to VRAM
@@ -681,7 +631,10 @@ static void uploadAtlasToChunk(GsRenderer* gs, uint16_t atlasId, int32_t firstCh
     uint32_t tbw = width / 64;
     uint32_t vramAddr = gs->textureVramBase + (uint32_t) firstChunk * VRAM_CHUNK_SIZE;
 
-    gsKit_texture_send((u32*) uploadData, width, height, vramAddr, psm, tbw, GS_CLUT_TEXTURE);
+    // We use GS_CLUT_NONE instead of GS_CLUT_TEXTURE so gsKit_texture_send appends a GS_TEXFLUSH after the DMA.
+    // If we use GS_CLUT_TEXTURE, we'll have texture corruption if the chunk is reused for a different atlas in the same frame.
+    // It is a bit hacky, but it works.
+    gsKit_texture_send((u32*) uploadData, width, height, vramAddr, psm, tbw, GS_CLUT_NONE);
 
     // Update chunk state
     int chunksUsed = atlasChunkCount(width, height, bpp);
@@ -735,7 +688,7 @@ static bool ensureAtlasLoaded(GsRenderer* gs, uint16_t atlasId) {
     gs->chunksNeededThisFrame += (uint16_t) chunksNeeded;
 
     // Allocate chunks (may evict or defrag)
-    int32_t chunkIdx = allocateChunks(gs, chunksNeeded);
+    int32_t chunkIdx = allocateChunks(gs, chunksNeeded, 0);
     if (0 > chunkIdx) {
         fprintf(stderr, "GsRenderer: VRAM exhausted! Cannot allocate %d chunk(s) for atlas %u (%ubpp)\n", chunksNeeded, atlasId, bpp);
         abort();
@@ -746,10 +699,165 @@ static bool ensureAtlasLoaded(GsRenderer* gs, uint16_t atlasId) {
     return true;
 }
 
+// ===[ Snapshot allocator (shared chunk pool) ]===
+
+// Allocates VRAM chunks for a w x h CT16 snapshot. Returns the snapshotChunks table index, or -1 on failure.
+static int32_t allocateSnapshotChunk(GsRenderer* gs, int32_t w, int32_t h) {
+    if (0 >= w || 0 >= h) return -1;
+
+    uint16_t tbw = (uint16_t) ((w + 63) / 64);
+    if (tbw == 0) tbw = 1;
+    uint32_t neededBytes = gsKit_texture_size(tbw * 64, h, GS_PSM_CT16);
+    int chunksNeeded = (int) ((neededBytes + VRAM_CHUNK_SIZE - 1) / VRAM_CHUNK_SIZE);
+    if (chunksNeeded <= 0) chunksNeeded = 1;
+
+    // Reuse a table row whose chunks have already been released (inUse=false). The chunks themselves get freshly allocated below; only the row index is recycled so tpagToSnapshot pointers can remain stable until sprite_delete reaps them.
+    int32_t snapIdx = -1;
+    uint32_t rowCount = (uint32_t) arrlen(gs->snapshotChunks);
+    repeat(rowCount, i) {
+        if (!gs->snapshotChunks[i].inUse) {
+            snapIdx = (int32_t) i;
+            break;
+        }
+    }
+    if (0 > snapIdx) {
+        SnapshotChunk zero = {0};
+        arrput(gs->snapshotChunks, zero);
+        snapIdx = (int32_t) (arrlen(gs->snapshotChunks) - 1);
+    }
+
+    // Acquire chunks via the shared atlas allocator (LRU-evicts atlases as needed; skips pinned snapshots).
+    int32_t firstChunk = allocateChunks(gs, chunksNeeded, gs->reservedAtlasChunks);
+    if (0 > firstChunk) {
+        rendererPrintf("GsRenderer: Cannot allocate %d chunks for snapshot (VRAM exhausted by pinned snapshots?)\n", chunksNeeded);
+        return -1;
+    }
+
+    // Pin the chunks: atlasId stays -1, snapshotIdx points at this row.
+    repeat(chunksNeeded, c) {
+        VRAMChunk* chunk = &gs->chunks[firstChunk + c];
+        chunk->atlasId = -1;
+        chunk->snapshotIdx = (int16_t) snapIdx;
+        chunk->lastUsed = 0;
+    }
+
+    SnapshotChunk* row = &gs->snapshotChunks[snapIdx];
+    row->firstChunk = (uint16_t) firstChunk;
+    row->chunkCount = (uint16_t) chunksNeeded;
+    row->width = (uint16_t) w;
+    row->height = (uint16_t) h;
+    row->tbw = tbw;
+    row->inUse = true;
+    return snapIdx;
+}
+
+static void freeSnapshotChunk(GsRenderer* gs, int32_t snapIdx) {
+    if (0 > snapIdx || (uint32_t) snapIdx >= (uint32_t) arrlen(gs->snapshotChunks)) return;
+    SnapshotChunk* row = &gs->snapshotChunks[snapIdx];
+    if (!row->inUse) return;
+    // Release the underlying chunks back to the atlas pool.
+    for (uint32_t c = 0; row->chunkCount > c; c++) {
+        VRAMChunk* chunk = &gs->chunks[row->firstChunk + c];
+        chunk->snapshotIdx = -1;
+        chunk->atlasId = -1;
+        chunk->lastUsed = 0;
+    }
+    row->inUse = false;
+    row->chunkCount = 0;
+}
+
+// ===[ Local-to-local GS bitblt (TRXDIR=2) ]===
+// Hand-rolled GIF packet - gsKit_texture_send only does host->local (TRXDIR=0).
+// BITBLTBUF SBP/DBP are VRAM byte address / 256 (block units). TBW is in 64-pixel blocks.
+static void gsLocalToLocalBlit(u32 srcVramBytes, u32 srcTbw, u32 srcPsm, u32 srcX, u32 srcY, u32 dstVramBytes, u32 dstTbw, u32 dstPsm, u32 dstX, u32 dstY, u32 w, u32 h) {
+    // Layout: [DMA_TAG CNT qwc=5][GIFTAG nloop=4][BITBLTBUF][TRXPOS][TRXREG][TRXDIR][DMA_TAG END qwc=2][GIFTAG nloop=1][TEXFLUSH] = 9 qw
+    const int p_size = 9;
+    u64* p_store = memalign(64, p_size * 16);
+    u64* p_data = p_store;
+
+    FlushCache(0);
+
+    *p_data++ = DMA_TAG(5, 0, DMA_CNT, 0, 0, 0);
+    *p_data++ = 0;
+
+    *p_data++ = GIF_TAG(4, 0, 0, 0, GSKIT_GIF_FLG_PACKED, 1);
+    *p_data++ = GIF_AD;
+
+    *p_data++ = GS_SETREG_BITBLTBUF(srcVramBytes / 256, srcTbw, srcPsm, dstVramBytes / 256, dstTbw, dstPsm);
+    *p_data++ = GS_BITBLTBUF;
+
+    *p_data++ = GS_SETREG_TRXPOS(srcX, srcY, dstX, dstY, 0);
+    *p_data++ = GS_TRXPOS;
+
+    *p_data++ = GS_SETREG_TRXREG(w, h);
+    *p_data++ = GS_TRXREG;
+
+    *p_data++ = GS_SETREG_TRXDIR(2);
+    *p_data++ = GS_TRXDIR;
+
+    *p_data++ = DMA_TAG(2, 0, DMA_END, 0, 0, 0);
+    *p_data++ = 0;
+
+    *p_data++ = GIF_TAG(1, 1, 0, 0, GSKIT_GIF_FLG_PACKED, 1);
+    *p_data++ = GIF_AD;
+
+    *p_data++ = 0;
+    *p_data++ = GS_TEXFLUSH;
+
+    dmaKit_wait_fast();
+    dmaKit_send_chain(DMA_CHANNEL_GIF, p_store, p_size);
+    dmaKit_wait_fast();
+    free(p_store);
+}
+
+// ===[ Runtime TPAG slot allocator ]===
+// Scans dynamic-allocation tail of dw->tpag.items[] for a free slot (texturePageId == -1) and appends a new entry if none are free.
+// The parallel "tpagToSnapshot" array is kept in sync (grown alongside dw->tpag).
+static uint32_t findOrAllocTpagSlot(GsRenderer* gs, DataWin* dw) {
+    for (uint32_t i = gs->originalTpagCount; dw->tpag.count > i; i++) {
+        if (dw->tpag.items[i].texturePageId == -1)
+            return i;
+    }
+    uint32_t newIndex = dw->tpag.count;
+    dw->tpag.count++;
+    dw->tpag.items = safeRealloc(dw->tpag.items, dw->tpag.count * sizeof(TexturePageItem));
+    memset(&dw->tpag.items[newIndex], 0, sizeof(TexturePageItem));
+    dw->tpag.items[newIndex].texturePageId = -1;
+
+    // Grow the snapshot mapping array to cover the new tpag slot
+    while (newIndex >= (uint32_t) arrlen(gs->tpagToSnapshot)) {
+        int32_t sentinel = -1;
+        arrput(gs->tpagToSnapshot, sentinel);
+    }
+
+    return newIndex;
+}
+
+// Returns the snapshot chunk index for a TPAG, or -1 if this TPAG is not a snapshot.
+static int32_t tpagSnapshotIndex(GsRenderer* gs, int32_t tpagIndex) {
+    if (0 > tpagIndex) return -1;
+    if ((uint32_t) tpagIndex >= (uint32_t) arrlen(gs->tpagToSnapshot)) return -1;
+    return gs->tpagToSnapshot[tpagIndex];
+}
+
 // ===[ GSTEXTURE setup for a given TPAG entry ]===
 // Configures a GSTEXTURE struct for rendering a specific atlas region.
 // The GSTEXTURE points to the atlas's VRAM location and the appropriate CLUT.
 static bool setupTextureForTPAG(GsRenderer* gs, GSTEXTURE* tex, int32_t tpagIndex) {
+    // Snapshot TPAGs (synthetic, created by sprite_create_from_surface) get their own CT16 direct-color path - no CLUT, no atlas lookup.
+    int32_t snapshotIdx = tpagSnapshotIndex(gs, tpagIndex);
+    if (snapshotIdx >= 0) {
+        SnapshotChunk* chunk = &gs->snapshotChunks[snapshotIdx];
+        memset(tex, 0, sizeof(GSTEXTURE));
+        tex->Width = chunk->width;
+        tex->Height = chunk->height;
+        tex->TBW = chunk->tbw;
+        tex->Vram = gs->textureVramBase + (uint32_t) chunk->firstChunk * VRAM_CHUNK_SIZE;
+        tex->PSM = GS_PSM_CT16;
+        tex->Filter = GS_FILTER_NEAREST;
+        return true;
+    }
+
     if (0 > tpagIndex || (uint32_t) tpagIndex >= gs->atlasTPAGCount) return false;
 
     AtlasTPAGEntry* entry = &gs->atlasTPAGEntries[tpagIndex];
@@ -906,6 +1014,10 @@ static void gsInit(Renderer* renderer, DataWin* dataWin) {
     // Enable alpha blending
     gs->gsGlobal->PrimAlphaEnable = GS_SETTING_ON;
     gs->blendEnabled = true;
+    gs->colorWriteR = true;
+    gs->colorWriteG = true;
+    gs->colorWriteB = true;
+    gs->colorWriteA = true;
     gs->currentBlendAlpha = GS_SETREG_ALPHA(0, 1, 0, 1, 0);
 
     // gsKit defaults Test->AREF to 0x80, but GMS's gpu_get_alphatestref() defaults to 0. Scripts that enable alpha test without calling gpu_set_alphatestref expect ref=0.
@@ -940,12 +1052,14 @@ static void gsInit(Renderer* renderer, DataWin* dataWin) {
     // Initialize the texture cache chunk pool (uses remaining VRAM after CLUTs)
     initTextureCache(gs);
 
-    // Read per-page format/size from TEXTURES.BIN headers
-    loadAtlasMetadata(gs);
+    // Capture original asset counts so we know which dw->tpag / dw->sprt slots are static (load-time) vs dynamic (runtime, created by sprite_create_from_surface).
+    gs->originalTpagCount = dataWin->tpag.count;
+    gs->originalSpriteCount = dataWin->sprt.count;
+
+    computeAtlasReservation(gs);
 
     // Initialize EE RAM cache for compressed atlas data
     initEeCache(gs);
-    preloadEeCache(gs);
 
     fprintf(stderr, "GsRenderer: Initialized (textured mode)\n");
 }
@@ -956,6 +1070,7 @@ static void gsDestroy(Renderer* renderer) {
         fclose(gs->texturesFile);
     }
     free(gs->atlasOffsets);
+    free(gs->atlasCompressionType);
     free(gs->atlasTPAGEntries);
     free(gs->atlasTileEntries);
     hmfree(gs->tileEntryMap);
@@ -969,6 +1084,9 @@ static void gsDestroy(Renderer* renderer) {
     free(gs->eeCache);
     free(gs->eeCacheEntries);
     free(gs->atlasDataSizes);
+    arrfree(gs->snapshotChunks);
+    arrfree(gs->tpagToSnapshot);
+    arrfree(gs->surfaces);
     free(gs);
 }
 
@@ -978,6 +1096,7 @@ static void gsBeginFrame(Renderer* renderer, MAYBE_UNUSED int32_t gameW, MAYBE_U
     gs->evictedAtlasUsedInCurrentFrame = false;
     gs->uniqueAtlasesThisFrame = 0;
     gs->chunksNeededThisFrame = 0;
+    gs->ramLoadsThisFrame = 0;
     gs->diskLoadsThisFrame = 0;
 
     // gsKit_setactive (called by sync_flip) re-emits FRAME with FBMSK=0, so any color-write mask we set last frame is gone. Re-apply it here for cases where GML leaves it asserted across frames.
@@ -986,8 +1105,12 @@ static void gsBeginFrame(Renderer* renderer, MAYBE_UNUSED int32_t gameW, MAYBE_U
     }
 }
 
-static void gsEndFrame(MAYBE_UNUSED Renderer* renderer) {
-    // No-op: flip happens in main loop
+static void gsEndFrameInit(MAYBE_UNUSED Renderer* renderer) {
+    // No-op: GS draws directly to the display buffer.
+}
+
+static void gsEndFrameEnd(MAYBE_UNUSED Renderer* renderer) {
+    // No-op: flip happens in main loop.
 }
 
 static void gsBeginView(Renderer* renderer, int32_t viewX, int32_t viewY, int32_t viewW, int32_t viewH, MAYBE_UNUSED int32_t portX, MAYBE_UNUSED int32_t portY, MAYBE_UNUSED int32_t portW, MAYBE_UNUSED int32_t portH, MAYBE_UNUSED float viewAngle) {
@@ -1136,17 +1259,25 @@ static void gsDrawSprite(Renderer* renderer, int32_t tpagIndex, float x, float y
         return;
     }
 
-    AtlasTPAGEntry* atlasEntry = &gs->atlasTPAGEntries[tpagIndex];
-
     // The atlas entry has the actual sprite dimensions in the atlas (post-crop, post-resize).
     // The screen rect covers cropW x cropH game-space pixels, positioned at (cropX, cropY)
     // within the original bounding box. The GS hardware stretches the atlas texels to fill.
 
-    // UV coords within the 512x512 atlas (in texels for gsKit)
-    float u0 = (float) atlasEntry->atlasX;
-    float v0 = (float) atlasEntry->atlasY;
-    float u1 = u0 + (float) atlasEntry->width;
-    float v1 = v0 + (float) atlasEntry->height;
+    // UV coords within the 512x512 atlas (in texels for gsKit). Snapshot tpags cover their own dedicated CT16 VRAM region from (0,0) to (width,height).
+    float u0, v0, u1, v1;
+    int32_t snapshotIdx = tpagSnapshotIndex(gs, tpagIndex);
+    if (snapshotIdx >= 0) {
+        SnapshotChunk* chunk = &gs->snapshotChunks[snapshotIdx];
+        u0 = 0.0f; v0 = 0.0f;
+        u1 = (float) chunk->width;
+        v1 = (float) chunk->height;
+    } else {
+        AtlasTPAGEntry* atlasEntry = &gs->atlasTPAGEntries[tpagIndex];
+        u0 = (float) atlasEntry->atlasX;
+        v0 = (float) atlasEntry->atlasY;
+        u1 = u0 + (float) atlasEntry->width;
+        v1 = v0 + (float) atlasEntry->height;
+    }
 
     // GS modulate mode: Output = Texture * Vertex / 128
     // Scale vertex RGB from 0-255 to 0-128 so white (255) becomes 128 (1.0x multiplier)
@@ -1230,11 +1361,20 @@ static void gsDrawTiled(Renderer* renderer, int32_t tpagIndex, float originX, fl
     GSTEXTURE tex;
     if (!setupTextureForTPAG(gs, &tex, tpagIndex)) return;
 
-    AtlasTPAGEntry* atlasEntry = &gs->atlasTPAGEntries[tpagIndex];
-    float u0 = (float) atlasEntry->atlasX;
-    float v0 = (float) atlasEntry->atlasY;
-    float u1 = u0 + (float) atlasEntry->width;
-    float v1 = v0 + (float) atlasEntry->height;
+    float u0, v0, u1, v1;
+    int32_t tiledSnapshotIdx = tpagSnapshotIndex(gs, tpagIndex);
+    if (tiledSnapshotIdx >= 0) {
+        SnapshotChunk* chunk = &gs->snapshotChunks[tiledSnapshotIdx];
+        u0 = 0.0f; v0 = 0.0f;
+        u1 = (float) chunk->width;
+        v1 = (float) chunk->height;
+    } else {
+        AtlasTPAGEntry* atlasEntry = &gs->atlasTPAGEntries[tpagIndex];
+        u0 = (float) atlasEntry->atlasX;
+        v0 = (float) atlasEntry->atlasY;
+        u1 = u0 + (float) atlasEntry->width;
+        v1 = v0 + (float) atlasEntry->height;
+    }
 
     // 0x80 is the exact 1.0x multiplier in GS modulate mode (output = texture * vertex / 128).
     // So, to avoid dimming the texture (BGR_R(0xFFFFFF) >> 1 = 0x7F is 0.992x) we'll hand-pick the white case.
@@ -1300,16 +1440,31 @@ static void gsDrawTiledPart(Renderer* renderer, int32_t tpagIndex, int32_t srcX,
     GSTEXTURE tex;
     if (!setupTextureForTPAG(gs, &tex, tpagIndex)) return;
 
-    AtlasTPAGEntry* atlasEntry = &gs->atlasTPAGEntries[tpagIndex];
     TexturePageItem* tpag = &dw->tpag.items[tpagIndex];
 
-    // Crop coords in source-page space (matching gsDrawSpritePart's coordinate system).
-    float cX = (float) atlasEntry->cropX - (float) tpag->targetX;
-    float cY = (float) atlasEntry->cropY - (float) tpag->targetY;
-    float cW = (float) atlasEntry->cropW;
-    float cH = (float) atlasEntry->cropH;
-    float ratioX = cW > 0.0f ? (float) atlasEntry->width  / cW : 1.0f;
-    float ratioY = cH > 0.0f ? (float) atlasEntry->height / cH : 1.0f;
+    // Snapshot tpags have no atlas remap: UV origin (0,0), no crop, 1:1 ratio.
+    float cX, cY, cW, cH;
+    float atlasU0, atlasV0;
+    float ratioX, ratioY;
+    int32_t tpSnapIdx = tpagSnapshotIndex(gs, tpagIndex);
+    if (tpSnapIdx >= 0) {
+        SnapshotChunk* chunk = &gs->snapshotChunks[tpSnapIdx];
+        cX = 0.0f; cY = 0.0f;
+        cW = (float) chunk->width;
+        cH = (float) chunk->height;
+        atlasU0 = 0.0f; atlasV0 = 0.0f;
+        ratioX = 1.0f; ratioY = 1.0f;
+    } else {
+        AtlasTPAGEntry* atlasEntry = &gs->atlasTPAGEntries[tpagIndex];
+        cX = (float) atlasEntry->cropX - (float) tpag->targetX;
+        cY = (float) atlasEntry->cropY - (float) tpag->targetY;
+        cW = (float) atlasEntry->cropW;
+        cH = (float) atlasEntry->cropH;
+        atlasU0 = (float) atlasEntry->atlasX;
+        atlasV0 = (float) atlasEntry->atlasY;
+        ratioX = cW > 0.0f ? (float) atlasEntry->width  / cW : 1.0f;
+        ratioY = cH > 0.0f ? (float) atlasEntry->height / cH : 1.0f;
+    }
 
     uint8_t r, g, b;
     if (color == 0xFFFFFFu) { r = g = b = 0x80; } else { r = BGR_R(color) >> 1; g = BGR_G(color) >> 1; b = BGR_B(color) >> 1; }
@@ -1336,7 +1491,7 @@ static void gsDrawTiledPart(Renderer* renderer, int32_t tpagIndex, int32_t srcX,
         if (intY1 >= intY2) continue;
         float clipOffY = intY1 - (float) srcY;
         float visH = intY2 - intY1;
-        float v0 = (float) atlasEntry->atlasY + (intY1 - cY) * ratioY;
+        float v0 = atlasV0 + (intY1 - cY) * ratioY;
         float v1 = v0 + visH * ratioY;
 
         float sy0 = (rowDstY + clipOffY + viewBaseY) * viewScaleY + viewOffY;
@@ -1355,7 +1510,7 @@ static void gsDrawTiledPart(Renderer* renderer, int32_t tpagIndex, int32_t srcX,
             if (intX1 >= intX2) continue;
             float clipOffX = intX1 - (float) srcX;
             float visW = intX2 - intX1;
-            float u0 = (float) atlasEntry->atlasX + (intX1 - cX) * ratioX;
+            float u0 = atlasU0 + (intX1 - cX) * ratioX;
             float u1 = u0 + visW * ratioX;
 
             float sx0 = (colDstX + clipOffX + viewBaseX) * viewScaleX + viewOffX;
@@ -1378,16 +1533,30 @@ static void gsDrawSpritePart(Renderer* renderer, int32_t tpagIndex, int32_t srcO
     GSTEXTURE tex;
     bool hasTexture = setupTextureForTPAG(gs, &tex, tpagIndex);
 
-    AtlasTPAGEntry* atlasEntry = hasTexture ? &gs->atlasTPAGEntries[tpagIndex] : nullptr;
     TexturePageItem* tpag = &renderer->dataWin->tpag.items[tpagIndex];
+    int32_t snapPartIdx = tpagSnapshotIndex(gs, tpagIndex);
+    SnapshotChunk* snapPartChunk = (snapPartIdx >= 0) ? &gs->snapshotChunks[snapPartIdx] : nullptr;
+    AtlasTPAGEntry* atlasEntry = (hasTexture && snapPartIdx < 0) ? &gs->atlasTPAGEntries[tpagIndex] : nullptr;
 
     // srcOffX/srcOffY are in source-page space (Renderer_drawSpritePartExt subtracts tpag->targetX/Y to convert from GML sprite-bounding space).
     // The preprocessor's cropX/cropY, however, are in sprite-bounding space (extractFromTPAG builds a boundingWidth x boundingHeight image with pixels offset by targetX/targetY, then cropTransparentBorders runs on that).
     // Subtract targetX/targetY here so both sides of the intersection live in the same coordinate system.
-    float cX = hasTexture ? ((float) atlasEntry->cropX - (float) tpag->targetX) : 0.0f;
-    float cY = hasTexture ? ((float) atlasEntry->cropY - (float) tpag->targetY) : 0.0f;
-    float cW = hasTexture ? (float) atlasEntry->cropW : (float) tpag->sourceWidth;
-    float cH = hasTexture ? (float) atlasEntry->cropH : (float) tpag->sourceHeight;
+    // Snapshot tpags have no crop/atlas remap: the full chunk IS the sprite.
+    float cX, cY, cW, cH;
+    if (snapPartChunk != nullptr) {
+        cX = 0.0f; cY = 0.0f;
+        cW = (float) snapPartChunk->width;
+        cH = (float) snapPartChunk->height;
+    } else if (hasTexture) {
+        cX = (float) atlasEntry->cropX - (float) tpag->targetX;
+        cY = (float) atlasEntry->cropY - (float) tpag->targetY;
+        cW = (float) atlasEntry->cropW;
+        cH = (float) atlasEntry->cropH;
+    } else {
+        cX = 0.0f; cY = 0.0f;
+        cW = (float) tpag->sourceWidth;
+        cH = (float) tpag->sourceHeight;
+    }
 
     float intX1 = fmaxf((float) srcOffX, cX);
     float intY1 = fmaxf((float) srcOffY, cY);
@@ -1458,12 +1627,19 @@ static void gsDrawSpritePart(Renderer* renderer, int32_t tpagIndex, int32_t srcO
         return;
     }
 
-    // Map intersection region to atlas UV space
-    float ratioX = (cW > 0) ? ((float) atlasEntry->width / cW) : 1.0f;
-    float ratioY = (cH > 0) ? ((float) atlasEntry->height / cH) : 1.0f;
-
-    float u0 = (float) atlasEntry->atlasX + (intX1 - cX) * ratioX;
-    float v0 = (float) atlasEntry->atlasY + (intY1 - cY) * ratioY;
+    // Map intersection region to atlas UV space. Snapshot tpags are 1:1 with their own VRAM region.
+    float ratioX, ratioY, atlasU0, atlasV0;
+    if (snapPartChunk != nullptr) {
+        ratioX = 1.0f; ratioY = 1.0f;
+        atlasU0 = 0.0f; atlasV0 = 0.0f;
+    } else {
+        ratioX = (cW > 0) ? ((float) atlasEntry->width / cW) : 1.0f;
+        ratioY = (cH > 0) ? ((float) atlasEntry->height / cH) : 1.0f;
+        atlasU0 = (float) atlasEntry->atlasX;
+        atlasV0 = (float) atlasEntry->atlasY;
+    }
+    float u0 = atlasU0 + (intX1 - cX) * ratioX;
+    float v0 = atlasV0 + (intY1 - cY) * ratioY;
     float u1 = u0 + visW * ratioX;
     float v1 = v0 + visH * ratioY;
 
@@ -1511,13 +1687,21 @@ static void gsDrawSpritePos(Renderer* renderer, int32_t tpagIndex, float x1, flo
         return;
     }
 
-    AtlasTPAGEntry* atlasEntry = &gs->atlasTPAGEntries[tpagIndex];
-
-    // Map the entire atlas entry (the trimmed source content in atlas texels) to the user's quad.
-    float u0 = (float) atlasEntry->atlasX;
-    float v0 = (float) atlasEntry->atlasY;
-    float u1 = u0 + (float) atlasEntry->width;
-    float v1 = v0 + (float) atlasEntry->height;
+    // Map the entire atlas entry (the trimmed source content in atlas texels) to the user's quad. Snapshot tpags cover (0,0)..(w,h) of their VRAM region.
+    float u0, v0, u1, v1;
+    int32_t posSnapIdx = tpagSnapshotIndex(gs, tpagIndex);
+    if (posSnapIdx >= 0) {
+        SnapshotChunk* chunk = &gs->snapshotChunks[posSnapIdx];
+        u0 = 0.0f; v0 = 0.0f;
+        u1 = (float) chunk->width;
+        v1 = (float) chunk->height;
+    } else {
+        AtlasTPAGEntry* atlasEntry = &gs->atlasTPAGEntries[tpagIndex];
+        u0 = (float) atlasEntry->atlasX;
+        v0 = (float) atlasEntry->atlasY;
+        u1 = u0 + (float) atlasEntry->width;
+        v1 = v0 + (float) atlasEntry->height;
+    }
 
     // GS modulate mode: Output = Texture * Vertex / 128
     uint8_t a = alphaToGS(alpha);
@@ -1561,6 +1745,11 @@ static void gsDrawRectangle(Renderer* renderer, float x1, float y1, float x2, fl
     } else {
         gsKit_prim_sprite(gs->gsGlobal, sx1, sy1, sx2, sy2, 0, rectColor);
     }
+}
+
+static void gsDrawRectangleColor(Renderer* renderer, float x1, float y1, float x2, float y2, uint32_t color1, MAYBE_UNUSED uint32_t color2, MAYBE_UNUSED uint32_t color3, MAYBE_UNUSED uint32_t color4, float alpha, bool outline) {
+    // Stub! Please implement me later. :3
+    gsDrawRectangle(renderer, x1, y1, x2, y2, color1, alpha, outline);
 }
 
 static void gsDrawLine(Renderer* renderer, float x1, float y1, float x2, float y2, MAYBE_UNUSED float width, uint32_t color, float alpha) {
@@ -1664,7 +1853,7 @@ static bool gsResolveGlyph(GsRenderer* gs, DataWin* dw, GsFontState* state, Font
     return true;
 }
 
-static void gsDrawText(Renderer* renderer, const char* text, float x, float y, float xscale, float yscale, MAYBE_UNUSED float angleDeg) {
+static void gsDrawText(Renderer* renderer, const char* text, float x, float y, float xscale, float yscale, MAYBE_UNUSED float angleDeg, float lineSeparation) {
     GsRenderer* gs = (GsRenderer*) renderer;
     DataWin* dw = renderer->dataWin;
 
@@ -1693,7 +1882,8 @@ static void gsDrawText(Renderer* renderer, const char* text, float x, float y, f
 
     // Vertical alignment
     int32_t lineCount = TextUtils_countLines(text, textLen);
-    float lineStride = TextUtils_lineStride(font);
+    // Caller-supplied separation is in world pre-scale pixels; divide by font->scaleY so the transform restores it.
+    float lineStride = (0.0f > lineSeparation) ? TextUtils_lineStride(font) : (lineSeparation / (font->scaleY != 0.0f ? font->scaleY : 1.0f));
     float valignOffset = 0;
     if (renderer->drawValign != 0) {
         float totalHeight = (float) lineCount * lineStride;
@@ -1779,7 +1969,7 @@ static void gsDrawText(Renderer* renderer, const char* text, float x, float y, f
     }
 }
 
-static void gsDrawTextColor(Renderer* renderer, const char* text, float x, float y, float xscale, float yscale, MAYBE_UNUSED float angleDeg, int32_t _c1, int32_t _c2, int32_t _c3, int32_t _c4, float alpha) {
+static void gsDrawTextColor(Renderer* renderer, const char* text, float x, float y, float xscale, float yscale, MAYBE_UNUSED float angleDeg, int32_t _c1, int32_t _c2, int32_t _c3, int32_t _c4, float alpha, float lineSeparation) {
     GsRenderer* gs = (GsRenderer*) renderer;
     DataWin* dw = renderer->dataWin;
 
@@ -1800,7 +1990,7 @@ static void gsDrawTextColor(Renderer* renderer, const char* text, float x, float
 
     // Vertical alignment
     int32_t lineCount = TextUtils_countLines(text, textLen);
-    float lineStride = TextUtils_lineStride(font);
+    float lineStride = (0.0f > lineSeparation) ? TextUtils_lineStride(font) : (lineSeparation / (font->scaleY != 0.0f ? font->scaleY : 1.0f));
     float totalHeight = (float) lineCount * lineStride;
     float valignOffset = 0;
     if (renderer->drawValign == 1) valignOffset = -totalHeight / 2.0f;
@@ -1948,16 +2138,157 @@ static void gsClearScreen(Renderer* renderer, uint32_t color, float alpha) {
     uint8_t g = BGR_G(color) >> 1;
     uint8_t b = BGR_B(color) >> 1;
     uint8_t a = alphaToGS(alpha);
+    // draw_clear_alpha writes RGBA directly to the framebuffer in real GameMaker.
+    // The PS2 renderer keeps PRIM.ABE permanently on (so TEX0.TCC stays 1 for textured sprites), which means without overriding ALPHA here, clearing with alpha=0 would resolve to (Cs-Cd)*0 + Cd = Cd and not write anything.
+    // We also need to bypass two surface-only states for the duration of the clear: FBA (which would force the cleared a-bit back to 1) and alpha test (which would reject the alpha=0 clear quad outright).
+    uint8_t savedFba = gs->fba;
+    uint8_t savedAte = gs->gsGlobal->Test->ATE;
+    if (savedFba) gsApplyFBA(gs, 0);
+    if (savedAte) {
+        gs->gsGlobal->Test->ATE = 0;
+        gsKit_set_test(gs->gsGlobal, GS_ATEST_OFF);
+    }
+    gsKit_set_primalpha(gs->gsGlobal, GS_ALPHA_NO_BLEND, 0);
     gsKit_clear(gs->gsGlobal, GS_SETREG_RGBAQ(r, g, b, a, 0x00));
+    gsKit_set_primalpha(gs->gsGlobal, gs->blendEnabled ? gs->currentBlendAlpha : GS_ALPHA_NO_BLEND, 0);
+    if (savedAte) {
+        gs->gsGlobal->Test->ATE = 1;
+        gsKit_set_test(gs->gsGlobal, GS_ATEST_ON);
+    }
+    if (savedFba) gsApplyFBA(gs, 1);
 }
 
-static int32_t gsCreateSpriteFromSurface(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t surfaceID, MAYBE_UNUSED int32_t x, MAYBE_UNUSED int32_t y, MAYBE_UNUSED int32_t w, MAYBE_UNUSED int32_t h, MAYBE_UNUSED bool removeback, MAYBE_UNUSED bool smooth, MAYBE_UNUSED int32_t xorig, MAYBE_UNUSED int32_t yorig) {
-    rendererPrintf("GsRenderer: createSpriteFromSurface not supported on PS2\n");
-    return -1;
+static int32_t gsCreateSpriteFromSurface(Renderer* renderer, int32_t surfaceID, int32_t x, int32_t y, int32_t w, int32_t h, MAYBE_UNUSED bool removeback, MAYBE_UNUSED bool smooth, int32_t xorig, int32_t yorig) {
+    GsRenderer* gs = (GsRenderer*) renderer;
+    DataWin* dw = renderer->dataWin;
+
+    if (surfaceID != -1) {
+        rendererPrintf("GsRenderer: Trying to call sprite_create_from_surface on a non-main surface!\n");
+        return -1;
+    }
+
+    if (0 >= w || 0 >= h) return -1;
+
+    // The (x, y, w, h) arguments are in world/view-space (Undertale's sprite_create_from_screen_x wrapper passes world coords).
+    // The PS2 framebuffer is the rasterized output of the renderer's view transform: fb_pos = (world_pos - viewOrigin) * scale + offset.
+    // For Undertale on a 640x448 fb with a 320x240 view, scale=2 and offsetY=-16 (480 rendered, clipped to 448).
+    // Apply the same transform here so we read the actual fb pixels that correspond to the requested world rect.
+    float fbXf = ((float) x - (float) gs->viewX) * gs->scaleX + gs->offsetX;
+    float fbYf = ((float) y - (float) gs->viewY) * gs->scaleY + gs->offsetY;
+    float fbWf = (float) w * gs->scaleX;
+    float fbHf = (float) h * gs->scaleY;
+
+    // Round to integer fb pixels (floor origin, ceil far edge to avoid losing a fractional row/column).
+    int32_t fbRectX = (int32_t) floorf(fbXf);
+    int32_t fbRectY = (int32_t) floorf(fbYf);
+    int32_t fbRectRight = (int32_t) ceilf(fbXf + fbWf);
+    int32_t fbRectBottom = (int32_t) ceilf(fbYf + fbHf);
+
+    // Clip to live framebuffer bounds (the rect may extend past the top/bottom because Undertale renders a logical 480 into a 448 fb with offsetY=-16).
+    int32_t fbW = (int32_t) gs->gsGlobal->Width;
+    int32_t fbH = (int32_t) gs->gsGlobal->Height;
+    if (fbRectX < 0) fbRectX = 0;
+    if (fbRectY < 0) fbRectY = 0;
+    if (fbRectRight > fbW) fbRectRight = fbW;
+    if (fbRectBottom > fbH) fbRectBottom = fbH;
+    int32_t fbRectW = fbRectRight - fbRectX;
+    int32_t fbRectH = fbRectBottom - fbRectY;
+    if (0 >= fbRectW || 0 >= fbRectH) return -1;
+
+    // Snapshot chunk holds fb-space pixels. The sprite stays at world-space (w, h) so draw_sprite at world coords reverses the projection symmetrically (UV stretches the fb-rect snapshot back over the world rect).
+    int32_t chunkIdx = allocateSnapshotChunk(gs, fbRectW, fbRectH);
+    if (0 > chunkIdx) return -1;
+    SnapshotChunk* chunk = &gs->snapshotChunks[chunkIdx];
+    uint32_t snapshotVramAddr = gs->textureVramBase + (uint32_t) chunk->firstChunk * VRAM_CHUNK_SIZE;
+
+    // Drain any pending gsKit draw commands into the GIF before snapshotting, so the bitblt reads a coherent framebuffer.
+    gsKit_queue_exec(gs->gsGlobal);
+    dmaKit_wait_fast();
+
+    uint32_t fbVramBase = gs->gsGlobal->ScreenBuffer[gs->gsGlobal->ActiveBuffer & 1];
+    uint32_t fbTbw = gs->gsGlobal->Width / 64;
+
+    gsLocalToLocalBlit(
+        fbVramBase, fbTbw, GS_PSM_CT16, (uint32_t) fbRectX, (uint32_t) fbRectY,
+        snapshotVramAddr, chunk->tbw, GS_PSM_CT16, 0, 0,
+        (uint32_t) fbRectW, (uint32_t) fbRectH
+    );
+
+    // Sprite/TPAG dimensions are in world space (what GML thinks the sprite is sized as). UV uses chunk->width/height (fb-space) to stretch the fb-rect back over the world rect when drawn.
+    int32_t spriteW = w;
+    int32_t spriteH = h;
+
+    // Allocate a synthetic TPAG slot pointing at the snapshot chunk.
+    uint32_t tpagIndex = findOrAllocTpagSlot(gs, dw);
+    TexturePageItem* tpag = &dw->tpag.items[tpagIndex];
+    tpag->sourceX = 0;
+    tpag->sourceY = 0;
+    tpag->sourceWidth = (uint16_t) spriteW;
+    tpag->sourceHeight = (uint16_t) spriteH;
+    tpag->targetX = 0;
+    tpag->targetY = 0;
+    tpag->targetWidth = (uint16_t) spriteW;
+    tpag->targetHeight = (uint16_t) spriteH;
+    tpag->boundingWidth = (uint16_t) spriteW;
+    tpag->boundingHeight = (uint16_t) spriteH;
+    tpag->texturePageId = 0; // Real page id is irrelevant for snapshot tpags; the sentinel is the tpagToSnapshot mapping. 0 (not -1) so findOrAllocTpagSlot won't reclaim this slot.
+
+    // Wire the TPAG -> snapshot chunk mapping (parallel array, indexed by tpagIndex).
+    while ((uint32_t) arrlen(gs->tpagToSnapshot) <= tpagIndex) {
+        int32_t sentinel = -1;
+        arrput(gs->tpagToSnapshot, sentinel);
+    }
+    gs->tpagToSnapshot[tpagIndex] = chunkIdx;
+
+    // Allocate a sprite slot. DataWin_allocSpriteSlot handles name + slot reuse.
+    uint32_t spriteIndex = DataWin_allocSpriteSlot(dw, gs->originalSpriteCount);
+    Sprite* sprite = &dw->sprt.sprites[spriteIndex];
+    sprite->width = (uint32_t) spriteW;
+    sprite->height = (uint32_t) spriteH;
+    sprite->originX = xorig;
+    sprite->originY = yorig;
+    sprite->textureCount = 1;
+    sprite->tpagIndices = safeMalloc(sizeof(int32_t));
+    sprite->tpagIndices[0] = (int32_t) tpagIndex;
+    sprite->maskCount = 0;
+    sprite->masks = nullptr;
+
+    rendererPrintf("GsRenderer: Snapshot sprite %u world=%dx%d fb=%dx%d@(%d,%d) tpag=%u row=%d firstChunk=%u count=%u vram=0x%08X\n", spriteIndex, spriteW, spriteH, fbRectW, fbRectH, fbRectX, fbRectY, tpagIndex, chunkIdx, chunk->firstChunk, chunk->chunkCount, snapshotVramAddr);
+    return (int32_t) spriteIndex;
 }
 
-static void gsDeleteSprite(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t spriteIndex) {
-    // No-op
+static void gsDeleteSprite(Renderer* renderer, int32_t spriteIndex) {
+    GsRenderer* gs = (GsRenderer*) renderer;
+    DataWin* dw = renderer->dataWin;
+
+    if (0 > spriteIndex || (uint32_t) spriteIndex >= dw->sprt.count) return;
+    // Refuse to delete original data.win sprites - their tpagIndices point into the static atlas, not snapshot pool.
+    if (gs->originalSpriteCount > (uint32_t) spriteIndex) {
+        fprintf(stderr, "GsRenderer: Cannot delete data.win sprite %d\n", spriteIndex);
+        return;
+    }
+
+    Sprite* sprite = &dw->sprt.sprites[spriteIndex];
+    if (sprite->textureCount == 0) return; // already deleted
+
+    // Free snapshot chunk(s) and reclaim TPAG slot(s) owned by this sprite.
+    repeat(sprite->textureCount, i) {
+        int32_t tpagIdx = sprite->tpagIndices[i];
+        if (0 > tpagIdx) continue;
+        if (gs->originalTpagCount > (uint32_t) tpagIdx) continue; // static atlas TPAG; not ours to free
+        int32_t snapIdx = tpagSnapshotIndex(gs, tpagIdx);
+        if (snapIdx >= 0) {
+            freeSnapshotChunk(gs, snapIdx);
+            gs->tpagToSnapshot[tpagIdx] = -1;
+        }
+        dw->tpag.items[tpagIdx].texturePageId = -1; // mark free for findOrAllocTpagSlot reuse
+    }
+
+    // Clear the sprite slot. Preserve "name" for asset_get_index across the memset (slot stays in sprt.count).
+    free(sprite->tpagIndices);
+    const char* keepName = sprite->name;
+    memset(sprite, 0, sizeof(Sprite));
+    sprite->name = keepName;
 }
 
 // PS2 GS only supports a single blend equation:
@@ -2030,6 +2361,25 @@ static void gsGpuSetBlendModeExt(Renderer* renderer, int32_t sfactor, int32_t df
     gsCommitBlend(gs);
 }
 
+// While a surface is bound, FBA + alpha-test follow the GML's blend-enable signal:
+// * blend ON  -> FBA=1, ATE=1: sprite-friendly. Opaque texels get a-bit forced to 1; transparent atlas texels (alpha=0) are discarded so the cleared a-bit=0 survives the surrounding region.
+// * blend OFF -> FBA=0, ATE=0: mask-friendly. Source alpha passes straight through to the CT16 a-bit so that masks can carve actual transparent holes in the surface.
+// Outside a surface this helper is a no-op; the main FB keeps its existing FBA-via-colorwriteenable + ATE-via-alphatestenable behavior.
+static void gsApplySurfaceWriteMode(GsRenderer* gs) {
+    if (gs->currentSurface == -1) return;
+    if (gs->surfaces[gs->currentSurface].chunkCount == 0) return; // phantom: leave FBMSK masking everything
+    uint8_t wantFba = gs->blendEnabled ? 1 : 0;
+    uint8_t wantAte = gs->blendEnabled ? 1 : 0;
+    if (gs->fba != wantFba) gsApplyFBA(gs, wantFba);
+    if (gs->gsGlobal->Test->ATE != wantAte) {
+        gs->gsGlobal->Test->ATE = wantAte;
+        gs->gsGlobal->Test->ATST = 6;   // GREATER
+        gs->gsGlobal->Test->AREF = 0;
+        gs->gsGlobal->Test->AFAIL = 0;  // KEEP (no write on fail)
+        gsKit_set_test(gs->gsGlobal, wantAte ? GS_ATEST_ON : GS_ATEST_OFF);
+    }
+}
+
 static void gsGpuSetBlendEnable(Renderer* renderer, bool enable) {
     GsRenderer* gs = (GsRenderer*) renderer;
     // PrimAlphaEnable is OR'd into the PRIM bits gsKit emits with each primitive,
@@ -2037,7 +2387,24 @@ static void gsGpuSetBlendEnable(Renderer* renderer, bool enable) {
     if (gs->blendEnabled == enable) return;
     gs->blendEnabled = enable;
     gsCommitBlend(gs);
+    // Inside a surface, FBA + alpha-test track blend state so that "gpu_set_blendenable(false); draw alpha=0" punches an actual hole, while regular blended sprite draws keep their force-opaque + discard-transparent semantics.
+    gsApplySurfaceWriteMode(gs);
 }
+
+static bool gsGpuGetBlendEnable(Renderer* renderer) {
+    GsRenderer* gs = (GsRenderer*) renderer;
+
+    return gs->blendEnabled;
+}
+
+static void gsGpuGetColorWriteEnable(Renderer* renderer, bool* red, bool* green, bool* blue, bool* alpha) {
+    GsRenderer* gs = (GsRenderer*) renderer;
+    *red = gs->colorWriteR;
+    *green = gs->colorWriteG;
+    *blue = gs->colorWriteB;
+    *alpha = gs->colorWriteA;
+}
+
 
 static void gsGpuSetAlphaTestEnable(Renderer* renderer, bool enable) {
     GsRenderer* gs = (GsRenderer*) renderer;
@@ -2063,6 +2430,10 @@ static void gsGpuSetAlphaTestRef(Renderer* renderer, uint8_t ref) {
 
 static void gsGpuSetColorWriteEnable(Renderer* renderer, bool red, bool green, bool blue, bool alpha) {
     GsRenderer* gs = (GsRenderer*) renderer;
+    gs->colorWriteR = red;
+    gs->colorWriteG = green;
+    gs->colorWriteB = blue;
+    gs->colorWriteA = alpha;
     // FBMSK: bit=1 means MASK that bit (don't write). Layout is the conceptual RGBA8888 mapping
     // even when the framebuffer is CT16 - the GS remaps the relevant bits internally.
     u32 fbmsk = 0;
@@ -2078,13 +2449,61 @@ static void gsGpuSetColorWriteEnable(Renderer* renderer, bool red, bool green, b
     gsApplyFBA(gs, alphaOnly ? 0 : 1);
 }
 
+// Fallback for tiles not pre-baked into ATLAS.BIN.
+// Mirrors the generic Renderer_drawTile path: clamp the tile's source rect to the TPAG content area, then draw as a sub-rect of the background TPAG.
+static void gsDrawTileFromTPAG(GsRenderer* gs, RoomTile* tile, float offsetX, float offsetY) {
+    Renderer* renderer = &gs->base;
+    int32_t tpagIndex = Renderer_resolveObjectTPAGIndex(renderer->dataWin, tile);
+    if (0 > tpagIndex) return;
+
+    TexturePageItem* tpag = &renderer->dataWin->tpag.items[tpagIndex];
+
+    int32_t srcX = tile->sourceX;
+    int32_t srcY = tile->sourceY;
+    int32_t srcW = (int32_t) tile->width;
+    int32_t srcH = (int32_t) tile->height;
+    float drawX = (float) tile->x + offsetX;
+    float drawY = (float) tile->y + offsetY;
+
+    int32_t contentLeft = tpag->targetX;
+    int32_t contentTop = tpag->targetY;
+    if (contentLeft > srcX) {
+        int32_t clip = contentLeft - srcX;
+        drawX += (float) clip * tile->scaleX;
+        srcW -= clip;
+        srcX = contentLeft;
+    }
+    if (contentTop > srcY) {
+        int32_t clip = contentTop - srcY;
+        drawY += (float) clip * tile->scaleY;
+        srcH -= clip;
+        srcY = contentTop;
+    }
+
+    int32_t contentRight = tpag->targetX + tpag->sourceWidth;
+    int32_t contentBottom = tpag->targetY + tpag->sourceHeight;
+    if (srcX + srcW > contentRight) srcW = contentRight - srcX;
+    if (srcY + srcH > contentBottom) srcH = contentBottom - srcY;
+
+    if (0 >= srcW || 0 >= srcH) return;
+
+    int32_t atlasOffX = srcX - tpag->targetX;
+    int32_t atlasOffY = srcY - tpag->targetY;
+
+    uint32_t bgr = tile->color & 0x00FFFFFF;
+    gsDrawSpritePart(renderer, tpagIndex, atlasOffX, atlasOffY, srcW, srcH, drawX, drawY, tile->scaleX, tile->scaleY, 0.0f, 0.0f, 0.0f, bgr, tile->alpha);
+}
+
 static void gsDrawTile(Renderer* renderer, RoomTile* tile, float offsetX, float offsetY) {
     GsRenderer* gs = (GsRenderer*) renderer;
 
     // Look up the tile in the atlas tile entries
     AtlasTileEntry* tileEntry = findTileEntry(gs, (int16_t) tile->backgroundDefinition, (uint16_t) tile->sourceX, (uint16_t) tile->sourceY, (uint16_t) tile->width, (uint16_t) tile->height);
-    if (tileEntry == nullptr)
+    if (tileEntry == nullptr) {
+        // Runtime-added tiles (tile_add) won't be in the pre-baked atlas. Fall back to rendering the sub-rect from the background's TPAG entry.
+        gsDrawTileFromTPAG(gs, tile, offsetX, offsetY);
         return;
+    }
 
     // Set up GSTEXTURE for this tile entry
     GSTEXTURE tex;
@@ -2130,18 +2549,398 @@ static void gsDrawTile(Renderer* renderer, RoomTile* tile, float offsetX, float 
 
 // ===[ Surfaces ]===
 
-static int32_t gsCreateSurface(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t width, MAYBE_UNUSED int32_t height) { return -1; }
-static bool gsSurfaceExists(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t surfaceID) { return false; }
-static bool gsSetSurfaceTarget(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t surfaceID) { return false; }
-static bool gsResetSurfaceTarget(MAYBE_UNUSED Renderer* renderer) { return false; }
-static float gsGetSurfaceWidth(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t surfaceID) { return 0.0f; }
-static float gsGetSurfaceHeight(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t surfaceID) { return 0.0f; }
-static void gsDrawSurface(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t surfaceID, MAYBE_UNUSED float x, MAYBE_UNUSED float y, MAYBE_UNUSED float xscale, MAYBE_UNUSED float yscale, MAYBE_UNUSED float angleDeg, MAYBE_UNUSED uint32_t color, MAYBE_UNUSED float alpha) {}
-static void gsDrawSurfacePart(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t surfaceID, MAYBE_UNUSED int32_t x, MAYBE_UNUSED int32_t y, MAYBE_UNUSED int32_t left, MAYBE_UNUSED int32_t top, MAYBE_UNUSED int32_t width, MAYBE_UNUSED int32_t height, MAYBE_UNUSED float xscale, MAYBE_UNUSED float yscale, MAYBE_UNUSED uint32_t color, MAYBE_UNUSED float alpha) {}
-static void gsDrawSurfaceStretched(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t surfaceID, MAYBE_UNUSED float x, MAYBE_UNUSED float y, MAYBE_UNUSED float width, MAYBE_UNUSED float height) {}
-static void gsSurfaceResize(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t surfaceID, MAYBE_UNUSED int32_t width, MAYBE_UNUSED int32_t height) {}
-static void gsSurfaceFree(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t surfaceID) {}
-static void gsSurfaceCopy(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t DestSurfaceID, MAYBE_UNUSED int32_t DestX, MAYBE_UNUSED int32_t DestY, MAYBE_UNUSED int32_t SrcSurfaceID, MAYBE_UNUSED int32_t SrcX, MAYBE_UNUSED int32_t SrcY, MAYBE_UNUSED int32_t SrcW, MAYBE_UNUSED int32_t SrcH, MAYBE_UNUSED bool part) {}
+#define SURFACE_MAX_BYTES (1024 * 1024) // Hard cap per surface
+
+static bool gsSurfaceIsLive(GsRenderer* gs, int32_t surfaceID) {
+    if (0 > surfaceID) return false;
+    if ((uint32_t) surfaceID >= (uint32_t) arrlen(gs->surfaces)) return false;
+    return gs->surfaces[surfaceID].inUse;
+}
+
+// Re-emit FRAME_1/SCISSOR_1 (both contexts) for the current ScreenBuffer/Width/Height/PSM in gsGlobal.
+// Drains the queue first so any pending draws still hit the previous target.
+static void gsApplyFrameSwitch(GsRenderer* gs) {
+    gsKit_queue_exec(gs->gsGlobal);
+    dmaKit_wait_fast();
+    gsKit_setactive(gs->gsGlobal);
+}
+
+// Zero out a CT16 region in VRAM (writes 0x0000 = ARGB1555 fully transparent black) by uploading a zero buffer via host->local DMA.
+static void gsClearSurfaceVram(uint32_t vramAddr, uint32_t tbw, uint16_t paddedWidth, uint16_t height) {
+    size_t bytes = (size_t) paddedWidth * (size_t) height * 2;
+    // 128-byte alignment required by gsKit_texture_send/DMA.
+    uint8_t* zeros = (uint8_t*) safeMemalign(128, bytes);
+    memset(zeros, 0, bytes);
+    gsKit_texture_send((u32*) zeros, paddedWidth, height, vramAddr, GS_PSM_CT16, tbw, GS_CLUT_TEXTURE);
+    dmaKit_wait_fast();
+    free(zeros);
+}
+
+static int32_t gsCreateSurface(Renderer* renderer, int32_t width, int32_t height) {
+    GsRenderer* gs = (GsRenderer*) renderer;
+
+    if (0 >= width || 0 >= height) {
+        rendererPrintf("GsRenderer: surface_create rejected bad dims %dx%d\n", width, height);
+        return -1;
+    }
+
+    uint16_t tbw = (uint16_t) ((width + 63) / 64);
+    if (tbw == 0) tbw = 1;
+    uint32_t paddedWidth = (uint32_t) tbw * 64;
+    uint32_t bytes = gsKit_texture_size(paddedWidth, height, GS_PSM_CT16);
+
+    // Reuse a freed row if possible so the table doesn't grow unbounded.
+    int32_t row = -1;
+    uint32_t rowCount = (uint32_t) arrlen(gs->surfaces);
+    for (uint32_t i = 0; rowCount > i; i++) {
+        if (!gs->surfaces[i].inUse) { row = (int32_t) i; break; }
+    }
+    if (0 > row) {
+        Surface zero = {0};
+        arrput(gs->surfaces, zero);
+        row = (int32_t) (arrlen(gs->surfaces) - 1);
+    }
+
+    // When we aren't able to allocate this, we return a "phantom" row
+    int chunksNeeded = (int) ((bytes + VRAM_CHUNK_SIZE - 1) / VRAM_CHUNK_SIZE);
+    if (0 >= chunksNeeded) chunksNeeded = 1;
+
+    int32_t firstChunk = -1;
+    const char* phantomReason = nullptr;
+    if (bytes > SURFACE_MAX_BYTES) {
+        phantomReason = "exceeds per-surface byte cap";
+    } else {
+        // Allocate from the non-reserved tail of the chunk pool (same as snapshots).
+        firstChunk = allocateChunks(gs, chunksNeeded, gs->reservedAtlasChunks);
+        if (0 > firstChunk)
+            phantomReason = "out of VRAM";
+    }
+
+    if (phantomReason != nullptr) {
+        fprintf(stderr, "GsRenderer: surface_create(%d, %d) phantom (%s); needed %d chunks (%u bytes)\n", width, height, phantomReason, chunksNeeded, bytes);
+        Surface* s = &gs->surfaces[row];
+        s->firstChunk = 0;
+        s->chunkCount = 0;
+        s->width = (uint16_t) width;
+        s->height = (uint16_t) height;
+        s->tbw = tbw;
+        s->inUse = true;
+        return row;
+    }
+
+    // Pin chunks to this surface.
+    for (int c = 0; chunksNeeded > c; c++) {
+        VRAMChunk* chunk = &gs->chunks[firstChunk + c];
+        chunk->atlasId = -1;
+        chunk->snapshotIdx = -1;
+        chunk->surfaceIdx = (int16_t) row;
+        chunk->lastUsed = 0;
+    }
+
+    Surface* s = &gs->surfaces[row];
+    s->firstChunk = (uint16_t) firstChunk;
+    s->chunkCount = (uint16_t) chunksNeeded;
+    s->width = (uint16_t) width;
+    s->height = (uint16_t) height;
+    s->tbw = tbw;
+    s->inUse = true;
+
+    // Fully transparent initial state. GameMaker games rely on this even when they immediately follow up with draw_clear_alpha.
+    uint32_t vramAddr = gs->textureVramBase + (uint32_t) firstChunk * VRAM_CHUNK_SIZE;
+    gsClearSurfaceVram(vramAddr, tbw, (uint16_t) paddedWidth, (uint16_t) height);
+
+    rendererPrintf("GsRenderer: surface_create %d -> %dx%d (padded %u, tbw=%u, chunks=%d@%d, vram=0x%08X)\n", row, width, height, paddedWidth, tbw, chunksNeeded, firstChunk, vramAddr);
+    return row;
+}
+
+static bool gsSurfaceExists(Renderer* renderer, int32_t surfaceID) {
+    GsRenderer* gs = (GsRenderer*) renderer;
+    // The application_surface (sentinel ID on PS2) is always live: it's the GS screen framebuffer at a fixed VRAM address.
+    if (surfaceID == APPLICATION_SURFACE_ID) return true;
+    return gsSurfaceIsLive(gs, surfaceID);
+}
+
+// PS2's application surface IS the GS screen framebuffer, which lives at a fixed VRAM address outside the chunk pool.
+// There's nothing to allocate, so we just return the sentinel ID.
+static int32_t gsEnsureApplicationSurface(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t width, MAYBE_UNUSED int32_t height) {
+    return APPLICATION_SURFACE_ID;
+}
+
+static bool gsSetRenderTarget(Renderer* renderer, int32_t surfaceID) {
+    GsRenderer* gs = (GsRenderer*) renderer;
+
+    if (surfaceID == APPLICATION_SURFACE_ID) {
+        if (gs->currentSurface == -1) return true; // already on the main FB
+        bool wasPhantom = gs->surfaces[gs->currentSurface].chunkCount == 0;
+        if (wasPhantom) {
+            // Phantom pop: we never touched the FRAME/view; just restore the writemask we clobbered to discard the bar's draws.
+            gsApplyFBMask(gs, gs->savedFbmsk);
+            gs->currentSurface = -1;
+            return true;
+        }
+        // Restore framebuffer state captured on the most recent push.
+        gs->gsGlobal->ScreenBuffer[gs->gsGlobal->ActiveBuffer & 1] = gs->savedScreenBufferAddr;
+        gs->gsGlobal->Width = gs->savedFbWidth;
+        gs->gsGlobal->Height = gs->savedFbHeight;
+        gs->gsGlobal->PSM = gs->savedFbPSM;
+        gsApplyFrameSwitch(gs);
+        // Restore the alpha-test enable state the GML had asked for, and the main FB's FBA (typically 1 to keep its a-bit opaque).
+        gs->gsGlobal->Test->ATE = gs->savedAte;
+        gsKit_set_test(gs->gsGlobal, gs->savedAte ? GS_ATEST_ON : GS_ATEST_OFF);
+        if (gs->fba != gs->savedFba) gsApplyFBA(gs, gs->savedFba);
+        // Restore view transform so subsequent draws use the GML view coords again.
+        gs->scaleX = gs->savedScaleX;
+        gs->scaleY = gs->savedScaleY;
+        gs->offsetX = gs->savedOffsetX;
+        gs->offsetY = gs->savedOffsetY;
+        gs->viewX = gs->savedViewX;
+        gs->viewY = gs->savedViewY;
+        gs->currentSurface = -1;
+        return true;
+    }
+
+    if (!gsSurfaceIsLive(gs, surfaceID)) {
+        rendererPrintf("GsRenderer: surface_set_target on invalid surface %d\n", surfaceID);
+        return false;
+    }
+    if (gs->currentSurface != -1) {
+        // Nested surface targets are not supported yet; the tension bar (our only consumer) never nests.
+        rendererPrintf("GsRenderer: surface_set_target while another surface (%d) is already bound; ignoring nest into %d\n", gs->currentSurface, surfaceID);
+        return false;
+    }
+
+    Surface* s = &gs->surfaces[surfaceID];
+
+    if (s->chunkCount == 0) {
+        // Phantom push: nothing to render into. Mask all FB writes for the duration so the bar's draws fall on the floor, then mark currentSurface so reset_target knows to undo this.
+        gs->savedFbmsk = gs->fbmsk;
+        gsApplyFBMask(gs, 0xFFFFFFFFu);
+        gs->currentSurface = surfaceID;
+        return true;
+    }
+
+    uint32_t vramAddr = gs->textureVramBase + (uint32_t) s->firstChunk * VRAM_CHUNK_SIZE;
+
+    // Save framebuffer + view state so surface_reset_target can restore them.
+    gs->savedScreenBufferAddr = gs->gsGlobal->ScreenBuffer[gs->gsGlobal->ActiveBuffer & 1];
+    gs->savedFbWidth = gs->gsGlobal->Width;
+    gs->savedFbHeight = gs->gsGlobal->Height;
+    gs->savedFbPSM = gs->gsGlobal->PSM;
+    gs->savedAte = gs->gsGlobal->Test->ATE;
+    gs->savedFba = gs->fba;
+    gs->savedScaleX = gs->scaleX;
+    gs->savedScaleY = gs->scaleY;
+    gs->savedOffsetX = gs->offsetX;
+    gs->savedOffsetY = gs->offsetY;
+    gs->savedViewX = gs->viewX;
+    gs->savedViewY = gs->viewY;
+
+    // Switch the active screen buffer to the surface's VRAM region. gsKit_setactive re-emits FRAME_1/SCISSOR_1 (both contexts) from these fields.
+    gs->gsGlobal->ScreenBuffer[gs->gsGlobal->ActiveBuffer & 1] = vramAddr;
+    gs->gsGlobal->Width = (uint16_t) (s->tbw * 64); // padded width must match TBW for the FRAME register
+    gs->gsGlobal->Height = s->height;
+    gs->gsGlobal->PSM = GS_PSM_CT16;
+    gsApplyFrameSwitch(gs);
+
+    // Identity view: surface-local draws like draw_sprite(spr_tensionbar, 1, 0, 0) must land at exactly (0, 0) in surface space.
+    gs->scaleX = 1.0f;
+    gs->scaleY = 1.0f;
+    gs->offsetX = 0.0f;
+    gs->offsetY = 0.0f;
+    gs->viewX = 0;
+    gs->viewY = 0;
+    gs->currentSurface = surfaceID;
+
+    // Pick FBA + alpha-test based on the GML's current blend-enable state. See gsApplySurfaceWriteMode for the rationale.
+    gsApplySurfaceWriteMode(gs);
+    return true;
+}
+
+static float gsGetSurfaceWidth(Renderer* renderer, int32_t surfaceID) {
+    GsRenderer* gs = (GsRenderer*) renderer;
+    if (surfaceID == APPLICATION_SURFACE_ID) return (float) gs->gsGlobal->Width;
+    if (!gsSurfaceIsLive(gs, surfaceID)) return 0.0f;
+    return (float) gs->surfaces[surfaceID].width;
+}
+
+static float gsGetSurfaceHeight(Renderer* renderer, int32_t surfaceID) {
+    GsRenderer* gs = (GsRenderer*) renderer;
+    if (surfaceID == APPLICATION_SURFACE_ID) return (float) gs->gsGlobal->Height;
+    if (!gsSurfaceIsLive(gs, surfaceID)) return 0.0f;
+    return (float) gs->surfaces[surfaceID].height;
+}
+
+static void gsDrawSurface(Renderer* renderer, int32_t surfaceID, int32_t srcLeft, int32_t srcTop, int32_t srcWidth, int32_t srcHeight, float x, float y, float xscale, float yscale, float angleDeg, uint32_t color, float alpha) {
+    GsRenderer* gs = (GsRenderer*) renderer;
+
+    int32_t surfaceW;
+    int32_t surfaceH;
+    uint32_t srcVram;
+    uint32_t srcTbw;
+
+    if (surfaceID == APPLICATION_SURFACE_ID) {
+        // Sample the live GS screen framebuffer; flush pending draws first so the texture read sees a coherent FB.
+        gsKit_queue_exec(gs->gsGlobal);
+        dmaKit_wait_fast();
+        surfaceW = (int32_t) gs->gsGlobal->Width;
+        surfaceH = (int32_t) gs->gsGlobal->Height;
+        srcVram = gs->gsGlobal->ScreenBuffer[gs->gsGlobal->ActiveBuffer & 1];
+        srcTbw = (uint32_t) gs->gsGlobal->Width / 64;
+    } else {
+        if (!gsSurfaceIsLive(gs, surfaceID)) return;
+        Surface* s = &gs->surfaces[surfaceID];
+        if (s->chunkCount == 0) return; // phantom surface — fully transparent, nothing to draw
+        surfaceW = s->width;
+        surfaceH = s->height;
+        srcVram = gs->textureVramBase + (uint32_t) s->firstChunk * VRAM_CHUNK_SIZE;
+        srcTbw = s->tbw;
+    }
+
+    if (0 > srcWidth) { srcLeft = 0; srcTop = 0; srcWidth = surfaceW; srcHeight = surfaceH; }
+
+    float worldW = (float) srcWidth * xscale;
+    float worldH = (float) srcHeight * yscale;
+
+    if (angleDeg != 0.0f) {
+        // Tension bar (our only current consumer) never rotates. Add a quad_texture path when a game needs it.
+        rendererPrintf("GsRenderer: draw_surface ignoring non-zero angle %f\n", (double) angleDeg);
+    }
+
+    // Apply the renderer's view transform to land the quad in framebuffer space.
+    float sx0 = (x          - (float) gs->viewX) * gs->scaleX + gs->offsetX;
+    float sy0 = (y          - (float) gs->viewY) * gs->scaleY + gs->offsetY;
+    float sx1 = (x + worldW - (float) gs->viewX) * gs->scaleX + gs->offsetX;
+    float sy1 = (y + worldH - (float) gs->viewY) * gs->scaleY + gs->offsetY;
+
+    // Off-screen cull.
+    float minSX = fminf(sx0, sx1);
+    float maxSX = fmaxf(sx0, sx1);
+    float minSY = fminf(sy0, sy1);
+    float maxSY = fmaxf(sy0, sy1);
+    if (maxSX < 0.0f || minSX > PS2_SCREEN_WIDTH || maxSY < 0.0f || minSY > PS2_SCREEN_HEIGHT) return;
+
+    GSTEXTURE tex;
+    memset(&tex, 0, sizeof(tex));
+    tex.Width = surfaceW;
+    tex.Height = surfaceH;
+    tex.TBW = srcTbw;
+    tex.Vram = srcVram;
+    tex.PSM = GS_PSM_CT16;
+    tex.Filter = GS_FILTER_NEAREST;
+
+    uint8_t r = BGR_R(color) >> 1;
+    uint8_t g = BGR_G(color) >> 1;
+    uint8_t b = BGR_B(color) >> 1;
+    uint8_t a = alphaToGS(alpha);
+    u64 gsColor = GS_SETREG_RGBAQ(r, g, b, a, 0x00);
+
+    float u0 = (float) srcLeft;
+    float v0 = (float) srcTop;
+    float u1 = (float) (srcLeft + srcWidth);
+    float v1 = (float) (srcTop + srcHeight);
+
+    // REGION_CLAMP the sampler to the src rect so any scale rounding never reads padded columns/rows. See project_ps2_ct16_region_clamp.
+    gs->gsGlobal->Clamp->MINU = srcLeft;
+    gs->gsGlobal->Clamp->MAXU = srcLeft + srcWidth  - 1;
+    gs->gsGlobal->Clamp->MINV = srcTop;
+    gs->gsGlobal->Clamp->MAXV = srcTop  + srcHeight - 1;
+    gsKit_set_clamp(gs->gsGlobal, GS_CMODE_REGION_CLAMP);
+
+    gsKit_prim_sprite_texture(gs->gsGlobal, &tex, sx0, sy0, u0, v0, sx1, sy1, u1, v1, 0, gsColor);
+
+    // Restore default REPEAT so subsequent atlas draws aren't stuck on this region.
+    gsKit_set_clamp(gs->gsGlobal, GS_CMODE_REPEAT);
+}
+static void gsSurfaceResize(MAYBE_UNUSED Renderer* renderer, int32_t surfaceID, int32_t width, int32_t height) {
+    // No-op: PS2 doesn't actually resize anything
+}
+
+static void gsSurfaceFree(Renderer* renderer, int32_t surfaceID) {
+    GsRenderer* gs = (GsRenderer*) renderer;
+    if (!gsSurfaceIsLive(gs, surfaceID)) return;
+    if (gs->currentSurface == surfaceID) {
+        // Caller is freeing the surface while it's still bound as target. Pop back to the main FB first to keep gsGlobal coherent.
+        rendererPrintf("GsRenderer: surface_free %d while bound; auto-popping to main FB\n", surfaceID);
+        gsSetRenderTarget(renderer, APPLICATION_SURFACE_ID);
+    }
+
+    Surface* s = &gs->surfaces[surfaceID];
+    for (uint32_t c = 0; s->chunkCount > c; c++) {
+        VRAMChunk* chunk = &gs->chunks[s->firstChunk + c];
+        chunk->surfaceIdx = -1;
+        chunk->atlasId = -1;
+        chunk->snapshotIdx = -1;
+        chunk->lastUsed = 0;
+    }
+    s->inUse = false;
+    s->chunkCount = 0;
+}
+
+// surface_copy / surface_copy_part. Both source and destination are CT16 in the chunk pool (or the main framebuffer when SrcSurfaceID == APPLICATION_SURFACE_ID), so we can do a single local-to-local GS bitblt instead of going through the rasterizer.
+static void gsSurfaceCopy(Renderer* renderer, int32_t destSurfaceID, int32_t destX, int32_t destY, int32_t srcSurfaceID, int32_t srcX, int32_t srcY, int32_t srcW, int32_t srcH, bool part) {
+    GsRenderer* gs = (GsRenderer*) renderer;
+    if (!gsSurfaceIsLive(gs, destSurfaceID)) return;
+    Surface* dst = &gs->surfaces[destSurfaceID];
+    if (dst->chunkCount == 0) return; // phantom dest - nowhere to write
+
+    uint32_t srcVram;
+    uint32_t srcTbw;
+    int32_t  srcWidth;
+    int32_t  srcHeight;
+    if (srcSurfaceID == APPLICATION_SURFACE_ID) {
+        srcVram = gs->gsGlobal->ScreenBuffer[gs->gsGlobal->ActiveBuffer & 1];
+        srcTbw = (uint32_t) gs->gsGlobal->Width / 64;
+        srcWidth = (int32_t) gs->gsGlobal->Width;
+        srcHeight = (int32_t) gs->gsGlobal->Height;
+    } else {
+        if (!gsSurfaceIsLive(gs, srcSurfaceID)) return;
+        Surface* src = &gs->surfaces[srcSurfaceID];
+        if (src->chunkCount == 0) return; // phantom src - nothing to read
+        srcVram = gs->textureVramBase + (uint32_t) src->firstChunk * VRAM_CHUNK_SIZE;
+        srcTbw = src->tbw;
+        srcWidth = src->width;
+        srcHeight = src->height;
+    }
+
+    int32_t w, h;
+    if (part) {
+        w = srcW;
+        h = srcH;
+    } else {
+        srcX = 0; srcY = 0;
+        w = srcWidth;
+        h = srcHeight;
+    }
+
+    // Same fix as the one from gsCreateSpriteFromSurface
+    if (srcSurfaceID == APPLICATION_SURFACE_ID && part) {
+        srcX += (int32_t) floorf(gs->offsetX);
+        srcY += (int32_t) floorf(gs->offsetY);
+    }
+
+    // Clip source rect to source bounds, propagating the offset into the destination so we copy the right sub-region.
+    if (0 > srcX) { destX -= srcX; w += srcX; srcX = 0; }
+    if (0 > srcY) { destY -= srcY; h += srcY; srcY = 0; }
+    if (srcX + w > srcWidth)  w = srcWidth  - srcX;
+    if (srcY + h > srcHeight) h = srcHeight - srcY;
+    // Clip dest rect to dest bounds.
+    if (0 > destX) { srcX -= destX; w += destX; destX = 0; }
+    if (0 > destY) { srcY -= destY; h += destY; destY = 0; }
+    if (destX + w > dst->width)  w = dst->width  - destX;
+    if (destY + h > dst->height) h = dst->height - destY;
+    if (0 >= w || 0 >= h) return;
+
+    // Drain any pending gsKit draw commands into the GIF so the bitblt source is coherent. Same flush pattern gsCreateSpriteFromSurface uses.
+    gsKit_queue_exec(gs->gsGlobal);
+    dmaKit_wait_fast();
+
+    uint32_t dstVram = gs->textureVramBase + (uint32_t) dst->firstChunk * VRAM_CHUNK_SIZE;
+    gsLocalToLocalBlit(
+        srcVram, srcTbw, GS_PSM_CT16, (uint32_t) srcX, (uint32_t) srcY,
+        dstVram, dst->tbw, GS_PSM_CT16, (uint32_t) destX, (uint32_t) destY,
+        (uint32_t) w, (uint32_t) h
+    );
+}
 static bool gsSurfaceGetPixels(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t surfaceID, MAYBE_UNUSED uint8_t* outRGBA) { return false; }
 
 // ===[ Vtable ]===
@@ -2150,7 +2949,8 @@ static RendererVtable gsVtable = {
     .init = gsInit,
     .destroy = gsDestroy,
     .beginFrame = gsBeginFrame,
-    .endFrame = gsEndFrame,
+    .endFrameInit = gsEndFrameInit,
+    .endFrameEnd = gsEndFrameEnd,
     .beginView = gsBeginView,
     .endView = gsEndView,
     .beginGUI = gsBeginGUI,
@@ -2159,6 +2959,7 @@ static RendererVtable gsVtable = {
     .drawSpritePos = gsDrawSpritePos,
     .drawSpritePart = gsDrawSpritePart,
     .drawRectangle = gsDrawRectangle,
+    .drawRectangleColor = gsDrawRectangleColor,
     .drawLine = gsDrawLine,
     .drawLineColor = gsDrawLineColor,
     .drawText = gsDrawText,
@@ -2171,21 +2972,21 @@ static RendererVtable gsVtable = {
     .gpuSetBlendMode = gsGpuSetBlendMode,
     .gpuSetBlendModeExt = gsGpuSetBlendModeExt,
     .gpuSetBlendEnable = gsGpuSetBlendEnable,
+    .gpuGetBlendEnable = gsGpuGetBlendEnable,
     .gpuSetAlphaTestEnable = gsGpuSetAlphaTestEnable,
     .gpuSetAlphaTestRef = gsGpuSetAlphaTestRef,
     .gpuSetColorWriteEnable = gsGpuSetColorWriteEnable,
+    .gpuGetColorWriteEnable = gsGpuGetColorWriteEnable,
     .drawTile = gsDrawTile,
     .drawTiled = gsDrawTiled,
     .drawTiledPart = gsDrawTiledPart,
     .createSurface = gsCreateSurface,
     .surfaceExists = gsSurfaceExists,
-    .setSurfaceTarget = gsSetSurfaceTarget,
-    .resetSurfaceTarget = gsResetSurfaceTarget,
+    .setRenderTarget = gsSetRenderTarget,
+    .ensureApplicationSurface = gsEnsureApplicationSurface,
     .getSurfaceWidth = gsGetSurfaceWidth,
     .getSurfaceHeight = gsGetSurfaceHeight,
     .drawSurface = gsDrawSurface,
-    .drawSurfacePart = gsDrawSurfacePart,
-    .drawSurfaceStretched = gsDrawSurfaceStretched,
     .surfaceResize = gsSurfaceResize,
     .surfaceFree = gsSurfaceFree,
     .surfaceCopy = gsSurfaceCopy,
@@ -2200,5 +3001,6 @@ Renderer* GsRenderer_create(GSGLOBAL* gsGlobal) {
     gs->gsGlobal = gsGlobal;
     gs->scaleX = 2.0f;
     gs->scaleY = 2.0f;
+    gs->currentSurface = -1; // main framebuffer
     return (Renderer*) gs;
 }

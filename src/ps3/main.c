@@ -15,12 +15,22 @@
 #include "debug_overlay.h"
 #include "gl_legacy_renderer.h"
 #include "overlay_file_system.h"
+#include "ps3_overlay.h"
+#include "ps3_textures.h"
+#ifdef USE_OPENAL
 #include "al_audio_system.h"
+#endif
 #include "stb_ds.h"
 #include "stb_image_write.h"
 
 #include "utils.h"
 #include "profiler.h"
+
+// Paletted fragment shader.
+extern unsigned char paletted_fpo[];
+extern unsigned int  paletted_fpo_len;
+GLuint gPalettedProgram = 0;
+GLint  gPalettedUPaletteVLoc = -1;
 
 #include <io/pad.h>
 #include <sys/systime.h>
@@ -40,7 +50,7 @@ const PadMapping PAD_MAPPINGS[] = {
     { PAD_BUTTON_OFFSET_DIGITAL1, PAD_CTRL_LEFT,     VK_LEFT },
     { PAD_BUTTON_OFFSET_DIGITAL1, PAD_CTRL_RIGHT,    VK_RIGHT },
     { PAD_BUTTON_OFFSET_DIGITAL1, PAD_CTRL_START,    'C' },
-    { PAD_BUTTON_OFFSET_DIGITAL1, PAD_CTRL_SELECT,   VK_ESCAPE },
+    { PAD_BUTTON_OFFSET_DIGITAL1, PAD_CTRL_SELECT,   VK_F12 },
     { PAD_BUTTON_OFFSET_DIGITAL2, PAD_CTRL_CROSS,    'Z' },
     { PAD_BUTTON_OFFSET_DIGITAL2, PAD_CTRL_SQUARE,   'X' },
     { PAD_BUTTON_OFFSET_DIGITAL2, PAD_CTRL_TRIANGLE, 'C' },
@@ -147,16 +157,18 @@ int main(int argc, char* argv[]) {
     printf("%s\n", argv[0]);
     strcpy(buffer, argv[0]);
     char* tmp = str_replace(buffer, "butterscotch.elf", "");
-    char* tmp2 = str_replace(buffer, "EBOOT.BIN", "");
-    char* dataWinPath = malloc(strlen(tmp2) + strlen("data.win") + 1);
+	char* tmp2 = str_replace(tmp, "butterscotch.self", "");
+    char* tmp3 = str_replace(tmp2, "EBOOT.BIN", "");
+    char* dataWinPath = malloc(strlen(tmp3) + strlen("data.win") + 1);
     if (!dataWinPath) {
-        free(tmp);
+        free(tmp3);
         return 1;
     }
-    strcpy(dataWinPath, tmp2);
+    strcpy(dataWinPath, tmp3);
     strcat(dataWinPath, "data.win");
     free(tmp);
     free(tmp2);
+	free(tmp3);
     sysUtilRegisterCallback(SYSUTIL_EVENT_SLOT0, sys_callback, NULL);
     freq = sysGetTimebaseFrequency();
 
@@ -186,7 +198,8 @@ int main(int argc, char* argv[]) {
             .parseVari = true,
             .parseFunc = true,
             .parseStrg = true,
-            .parseTxtr = true,
+            // TXTR pages live in TEXTURES.BIN on PS3, not in data.win.
+            .parseTxtr = false,
             .parseAudo = true,
             .skipLoadingPreciseMasksForNonPreciseSprites = true,
             .lazyLoadRooms = true,
@@ -232,11 +245,46 @@ int main(int argc, char* argv[]) {
     ps3glInit();
     ioPadInit(7);
 
+    // Load TEXTURES.BIN
+    {
+        size_t dirLen = strlen(dataWinDir);
+        char* texturesBinPath = safeMalloc(dirLen + strlen("textures.bin") + 1);
+        memcpy(texturesBinPath, dataWinDir, dirLen);
+        strcpy(texturesBinPath + dirLen, "textures.bin");
+        if (!PS3Textures_init(texturesBinPath)) {
+            fprintf(stderr, "FATAL: failed to load %s\n", texturesBinPath);
+            return 1;
+        }
+        free(texturesBinPath);
+    }
+
     // Initialize the renderer
     Renderer* renderer = GLLegacyRenderer_create();
 
     // Initialize the audio system
+#ifdef USE_OPENAL
     AudioSystem* audioSystem = (AudioSystem*) AlAudioSystem_create();
+#else
+    AudioSystem* audioSystem = (AudioSystem*) NoopAudioSystem_create();
+#endif
+
+    PS3Overlay_init();
+
+    // Initialize the paletted shader
+    // The palette must ALWAYS be in TEXUNIT1!
+    {
+        GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderBinary(1, &fs, PS3GL_SHADER_BINARY_FPO, paletted_fpo, (GLsizei) paletted_fpo_len);
+        gPalettedProgram = glCreateProgram();
+        glAttachShader(gPalettedProgram, fs);
+        glLinkProgram(gPalettedProgram);
+        gPalettedUPaletteVLoc = glGetUniformLocation(gPalettedProgram, "uPaletteV");
+        GLint uPaletteLoc = glGetUniformLocation(gPalettedProgram, "uPalette");
+        glUseProgram(gPalettedProgram);
+        glUniform1i(uPaletteLoc, 1);
+        glUseProgram(0);
+        printf("Paletted shader: program=%u uPaletteV=%d uPalette=%d\n", gPalettedProgram, gPalettedUPaletteVLoc, uPaletteLoc);
+    }
 
     // Initialize the runner
     Runner* runner = Runner_create(dataWin, vm, renderer, (FileSystem*) overlayFs, audioSystem);
@@ -313,16 +361,26 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        if (RunnerKeyboard_checkPressed(runner->keyboard, VK_F12)) {
+            PS3Overlay_toggleDebugOverlay(runner);
+        }
+
         double frameStartTime = PS3_GET_TIME;
+        double stepTime = 0.0;
+        double audioTime = 0.0;
         if (shouldStep) {
             // Run one game step (Begin Step, Keyboard, Alarms, Step, End Step, room transitions)
+            double stepStart = PS3_GET_TIME;
             Runner_step(runner);
+            stepTime = PS3_GET_TIME - stepStart;
 
             // Update audio system (gain fading, cleanup ended sounds)
             float dt = (float) (PS3_GET_TIME - lastFrameTime);
             if (0.0f > dt) dt = 0.0f;
             if (dt > 0.1f) dt = 0.1f; // cap delta to avoid huge fades on lag spikes
+            double audioStart = PS3_GET_TIME;
             runner->audioSystem->vtable->update(runner->audioSystem, dt);
+            audioTime = PS3_GET_TIME - audioStart;
         }
 
         // Query actual framebuffer size (differs from window size on Wayland with fractional scaling)
@@ -343,27 +401,41 @@ int main(int argc, char* argv[]) {
         float displayScaleX;
         float displayScaleY;
 
+        Runner_drawPre(runner, fbWidth, fbHeight);
         Runner_computeViewDisplayScale(runner, gameW, gameH, &displayScaleX, &displayScaleY);
 
-        renderer->vtable->beginFrame(renderer, gameW, gameH, fbWidth, fbHeight);
+        Runner_beginFrame(runner, gameW, gameH, fbWidth, fbHeight);
 
         // Clear FBO with room background color
         if (runner->drawBackgroundColor) {
             int rInt = BGR_R(runner->backgroundColor);
             int gInt = BGR_G(runner->backgroundColor);
             int bInt = BGR_B(runner->backgroundColor);
-            glClearColor(rInt / 255.0f, gInt / 255.0f, bInt / 255.0f, 1.0f);
+            int aInt = BGR_A(runner->backgroundColor);
+            glClearColor(rInt / 255.0f, gInt / 255.0f, bInt / 255.0f, aInt / 255.0f);
         } else {
             glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         }
         glClear(GL_COLOR_BUFFER_BIT);
 
+        double drawStart = PS3_GET_TIME;
         Runner_drawViews(runner, gameW, gameH, displayScaleX, displayScaleY, debugShowCollisionMasks);
+        renderer->vtable->endFrameInit(renderer);
+        Runner_drawPost(runner, fbWidth, fbHeight);
+        renderer->vtable->endFrameEnd(renderer);
+        Runner_drawGUI(runner, fbWidth, fbHeight, gameW, gameH);
+        double drawTime = PS3_GET_TIME - drawStart;
 
-        renderer->vtable->endFrame(renderer);
+        // ===[ Debug Overlay ]===
+        double tickTime = PS3_GET_TIME - frameStartTime;
+        PS3Overlay_drawDebugOverlay(runner, (float) (tickTime * 1000.0), (float) (stepTime * 1000.0), (float) (drawTime * 1000.0), (float) (audioTime * 1000.0), fbWidth, fbHeight);
 
         sysUtilCheckCallback();
-        ps3glSwapBuffers();
+        // Only swap when there isn't a room change to match the original runner.
+        if (runner->pendingRoom == -1) {
+            ps3glSwapBuffers();
+        }
+        Runner_handlePendingRoomChange(runner);
 
         double now = PS3_GET_TIME;
 
@@ -390,6 +462,7 @@ int main(int argc, char* argv[]) {
 
 
     // Cleanup
+    PS3Overlay_deinit();
     runner->audioSystem->vtable->destroy(runner->audioSystem);
     runner->audioSystem = nullptr;
     renderer->vtable->destroy(renderer);
