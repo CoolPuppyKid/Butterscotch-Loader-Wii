@@ -126,8 +126,23 @@ static uint8_t* decodeBz2Qoi(const uint8_t* blob, size_t blobSize, bool gm2022_5
     int height = blob[6] | (blob[7] << 8);
     if (0 >= width || 0 >= height) return nullptr;
 
-    // Upper bound on decompressed QOI: header size + width*height*5 pixel data.
-    size_t uncompressedCapacity = QOI_HEADER_SIZE + (size_t) width * (size_t) height * 5;
+    // GMS 2022.5+ stores the exact decompressed QOI byte count in the 2zoq header.
+    // Use it when available; the old worst-case bound is enormous for 2048x2048 pages
+    // and can exhaust Wii RAM before the real QOI decoder even starts.
+    size_t uncompressedCapacity = 0;
+    if (gm2022_5) {
+        uint32_t expectedLen = (uint32_t)blob[8]
+            | ((uint32_t)blob[9] << 8)
+            | ((uint32_t)blob[10] << 16)
+            | ((uint32_t)blob[11] << 24);
+        if (expectedLen >= QOI_HEADER_SIZE) {
+            uncompressedCapacity = expectedLen;
+        }
+    }
+    if (uncompressedCapacity == 0) {
+        // Upper bound on decompressed QOI: header size + width*height*5 pixel data.
+        uncompressedCapacity = QOI_HEADER_SIZE + (size_t) width * (size_t) height * 5;
+    }
     uint8_t* uncompressed = (uint8_t*) malloc(uncompressedCapacity);
     if (!uncompressed) return nullptr;
 

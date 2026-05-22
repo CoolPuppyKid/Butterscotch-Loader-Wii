@@ -103,8 +103,6 @@ static void addDataWinDeviceCandidates(char candidates[][256], int* count, int m
     char dir[256];
     snprintf(dir, sizeof(dir), "%sbutterscotch/", root);
     addDataWinCandidatePair(candidates, count, maxCount, dir);
-    snprintf(dir, sizeof(dir), "%sapps/butterscotch/", root);
-    addDataWinCandidatePair(candidates, count, maxCount, dir);
 }
 
 static bool getDirectoryName(const char* path, char* outDir, size_t outDirSize)
@@ -513,26 +511,6 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "FAT initialized (%s)\n", g_sdWritable ? "read/write" : "read-only");
     fprintf(stderr, "Loading %s\n", dataWinPath);
 
-    loadingStep(5, 10, "SIZE DATA.WIN");
-    long dataWinSize = -1;
-    if (fseek(dataWinProbe, 0, SEEK_END) == 0) {
-        dataWinSize = ftell(dataWinProbe);
-        fseek(dataWinProbe, 0, SEEK_SET);
-    }
-    if (dataWinSize == 0) {
-        fclose(dataWinProbe);
-        fatalErrorForCandidates("DATA.WIN is empty", dataWinCandidates, dataWinCandidateCount);
-    }
-
-    loadingStep(5, 10, "CHECK DATA.WIN");
-    char dataWinMagic[4] = {0};
-    size_t magicRead = fread(dataWinMagic, 1, sizeof(dataWinMagic), dataWinProbe);
-    fclose(dataWinProbe);
-    if (magicRead != sizeof(dataWinMagic) || memcmp(dataWinMagic, "FORM", 4) != 0) {
-        fatalErrorForCandidates("DATA.WIN is not a FORM file", dataWinCandidates, dataWinCandidateCount);
-    }
-
-    fprintf(stderr, "DATA.WIN size=%lld\n", (long long)dataWinSize);
     loadingStep(5, 10, "PARSE DATA.WIN");
 
     DataWin* dataWin = DataWin_parse(dataWinPath,
@@ -604,9 +582,12 @@ int main(int argc, char* argv[]) {
         float displayScaleX = 1.0f;
         float displayScaleY = 1.0f;
         Runner_computeViewDisplayScale(runner, gameW, gameH, &displayScaleX, &displayScaleY);
-        renderer->vtable->beginFrame(renderer, gameW, gameH, screenW, screenH);
+        Runner_beginFrame(runner, gameW, gameH, screenW, screenH);
         Runner_drawViews(runner, gameW, gameH, displayScaleX, displayScaleY, false);
-        renderer->vtable->endFrame(renderer);
+        if (runner->pendingRoom == -1) {
+            renderer->vtable->endFrameEnd(renderer);
+        }
+        Runner_handlePendingRoomChange(runner);
         g_dbgDrawMs = ticks_to_millisecs(gettime() - drawStart);
 
         if ((runner->frameCount % 60) == 0) {

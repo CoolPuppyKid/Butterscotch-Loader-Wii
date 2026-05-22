@@ -270,11 +270,11 @@ static void wiiFileSystemAddMapping(WiiFileSystem* wfs, const char* gameFileName
     fprintf(stderr, "WiiFileSystem: '%s' -> '%s'\n", gameFileName, resolved);
 }
 
-FileSystem* WiiFileSystem_create(JsonValue* configRoot, const char* gameTitle, bool sdWritable) {
+FileSystem* WiiFileSystem_create(JsonValue* configRoot, const char* gameTitle, const char* basePath, bool sdWritable) {
     JsonValue* fileSystemObj = JsonReader_getObject(configRoot, "fileSystem");
     require(fileSystemObj != NULL && JsonReader_isObject(fileSystemObj));
 
-    WiiFileSystem* wfs = wiiFileSystemAlloc(gameTitle, "./", sdWritable);
+    WiiFileSystem* wfs = wiiFileSystemAlloc(gameTitle, basePath ? basePath : "./", sdWritable);
 
     int entryCount = JsonReader_objectLength(fileSystemObj);
     repeat(entryCount, i) {

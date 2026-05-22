@@ -1460,6 +1460,11 @@ static void grrDrawSpritePos(
 // ===================================================================
 // grrDrawRectangle  — pure raw GX, no GX
 // ===================================================================
+static void grrDrawLineColor(
+    Renderer* renderer,
+    float x1, float y1, float x2, float y2,
+    float width, uint32_t color1, uint32_t color2, float alpha);
+
 static void grrDrawRectangle(
     Renderer* renderer,
     float x1, float y1, float x2, float y2,
@@ -1484,6 +1489,32 @@ static void grrDrawRectangle(
         // Right
         emitQuad(x2,   y1+1, x2+1, y1+1, x2+1, y2, x2, y2,   0.5f,0.5f,0.5f,0.5f, r,g,b,a);
     }
+}
+
+static void grrDrawRectangleColor(
+    Renderer* renderer,
+    float x1, float y1, float x2, float y2,
+    uint32_t color1, uint32_t color2, uint32_t color3, uint32_t color4,
+    float alpha, bool outline)
+{
+    if (outline) {
+        grrDrawLineColor(renderer, x1, y1, x2, y1, 1.0f, color1, color2, alpha);
+        grrDrawLineColor(renderer, x2, y1, x2, y2, 1.0f, color2, color3, alpha);
+        grrDrawLineColor(renderer, x2, y2, x1, y2, 1.0f, color3, color4, alpha);
+        grrDrawLineColor(renderer, x1, y2, x1, y1, 1.0f, color4, color1, alpha);
+        return;
+    }
+
+    uint8_t a = grrAlphaToU8(alpha);
+    useColorOnlyTev();
+    emitQuadGrad(
+        x1, y1, x2 + 1.0f, y1, x2 + 1.0f, y2 + 1.0f, x1, y2 + 1.0f,
+        0.5f, 0.5f, 0.5f, 0.5f,
+        BGR_R(color1), BGR_G(color1), BGR_B(color1),
+        BGR_R(color2), BGR_G(color2), BGR_B(color2),
+        BGR_R(color3), BGR_G(color3), BGR_B(color3),
+        BGR_R(color4), BGR_G(color4), BGR_B(color4),
+        a);
 }
 
 // ===================================================================
@@ -1659,7 +1690,7 @@ static bool grrResolveGlyph(
 static void grrDrawText(
     Renderer* renderer,
     const char* text, float x, float y,
-    float xscale, float yscale, float angleDeg)
+    float xscale, float yscale, float angleDeg, float lineSeparation)
 {
     GRRRenderer* grr = (GRRRenderer*)renderer;
     DataWin* dw = renderer->dataWin;
@@ -1676,7 +1707,9 @@ static void grrDrawText(
 
     int32_t textLen = (int32_t)strlen(text);
     int32_t lineCount = TextUtils_countLines(text, textLen);
-    float lineStride = TextUtils_lineStride(font);
+    float lineStride = (0.0f > lineSeparation)
+        ? TextUtils_lineStride(font)
+        : (lineSeparation / (font->scaleY != 0.0f ? font->scaleY : 1.0f));
 
     float totalHeight = (float)lineCount * lineStride;
     float valignOffset = 0;
@@ -1748,7 +1781,7 @@ static void grrDrawTextColor(
     Renderer* renderer,
     const char* text, float x, float y,
     float xscale, float yscale, float angleDeg,
-    int32_t _c1, int32_t _c2, int32_t _c3, int32_t _c4, float alpha)
+    int32_t _c1, int32_t _c2, int32_t _c3, int32_t _c4, float alpha, float lineSeparation)
 {
     GRRRenderer* grr = (GRRRenderer*)renderer;
     DataWin* dw = renderer->dataWin;
@@ -1764,7 +1797,9 @@ static void grrDrawTextColor(
     if (textLen == 0) return;
 
     int32_t lineCount = TextUtils_countLines(text, textLen);
-    float lineStride = TextUtils_lineStride(font);
+    float lineStride = (0.0f > lineSeparation)
+        ? TextUtils_lineStride(font)
+        : (lineSeparation / (font->scaleY != 0.0f ? font->scaleY : 1.0f));
     float totalHeight = (float)lineCount * lineStride;
     float valignOffset = 0;
     if (renderer->drawValign == 1) valignOffset = -totalHeight / 2.0f;
@@ -1851,24 +1886,68 @@ static void grrDrawTextColor(
 
 static void grrDrawSurface(
     Renderer* renderer, int32_t surfaceID,
+    int32_t srcLeft, int32_t srcTop, int32_t srcWidth, int32_t srcHeight,
     float x, float y, float xscale, float yscale, float angleDeg,
     uint32_t color, float alpha)
 {
     GRRRenderer* grr = (GRRRenderer*)renderer;
+    if (surfaceID == APPLICATION_SURFACE_ID) return;
     if (surfaceID < 0 || (uint32_t)surfaceID >= grr->surfaceCount) return;
     if (!grr->surfaceBuffers[surfaceID]) return;
 
     int32_t texW = grr->surfaceWidth[surfaceID];
     int32_t texH = grr->surfaceHeight[surfaceID];
+    if (srcWidth <= 0) srcWidth = texW;
+    if (srcHeight <= 0) srcHeight = texH;
+    if (srcLeft < 0) {
+        srcWidth += srcLeft;
+        x -= (float)srcLeft * xscale;
+        srcLeft = 0;
+    }
+    if (srcTop < 0) {
+        srcHeight += srcTop;
+        y -= (float)srcTop * yscale;
+        srcTop = 0;
+    }
+    if (srcLeft + srcWidth > texW) srcWidth = texW - srcLeft;
+    if (srcTop + srcHeight > texH) srcHeight = texH - srcTop;
+    if (srcWidth <= 0 || srcHeight <= 0) return;
+
     uint8_t r = BGR_R(color), g = BGR_G(color), b = BGR_B(color);
     uint8_t a = grrAlphaToU8(alpha);
 
+    float x0 = x;
+    float y0 = y;
+    float x1 = x + (float)srcWidth * xscale;
+    float y1 = y;
+    float x2 = x1;
+    float y2 = y + (float)srcHeight * yscale;
+    float x3 = x;
+    float y3 = y2;
+
+    if (angleDeg != 0.0f) {
+        float rad = -angleDeg * ((float)M_PI / 180.0f);
+        float cosA = cosf(rad);
+        float sinA = sinf(rad);
+        float px[4] = { x0, x1, x2, x3 };
+        float py[4] = { y0, y1, y2, y3 };
+        float* ox[4] = { &x0, &x1, &x2, &x3 };
+        float* oy[4] = { &y0, &y1, &y2, &y3 };
+        for (int i = 0; i < 4; i++) {
+            float dx = px[i] - x;
+            float dy = py[i] - y;
+            *ox[i] = cosA * dx - sinA * dy + x;
+            *oy[i] = sinA * dx + cosA * dy + y;
+        }
+    }
+
+    float u0 = (float)srcLeft / (float)texW;
+    float v0 = (float)srcTop / (float)texH;
+    float u1 = (float)(srcLeft + srcWidth) / (float)texW;
+    float v1 = (float)(srcTop + srcHeight) / (float)texH;
+
     loadTexObj(&grr->surfaceTextures[surfaceID]);
-    emitQuad(x, y,
-             x + texW*xscale, y,
-             x + texW*xscale, y + texH*yscale,
-             x,               y + texH*yscale,
-             0.0f, 0.0f, 1.0f, 1.0f, r, g, b, a);
+    emitQuad(x0, y0, x1, y1, x2, y2, x3, y3, u0, v0, u1, v1, r, g, b, a);
 }
 
 static void grrDrawSurfaceStretched(
@@ -1990,6 +2069,13 @@ static int32_t grrCreateSurface(Renderer* renderer, int32_t width, int32_t heigh
 static void grrSurfaceResize(Renderer* renderer, int32_t surfaceID, int32_t width, int32_t height)
 {
     GRRRenderer* grr = (GRRRenderer*)renderer;
+    if (surfaceID == APPLICATION_SURFACE_ID) {
+        if (renderer->runner != NULL) {
+            if (width > 0) renderer->runner->applicationWidth = width;
+            if (height > 0) renderer->runner->applicationHeight = height;
+        }
+        return;
+    }
     if (surfaceID < 0 || (uint32_t)surfaceID >= grr->surfaceCount) return;
     if (width <= 0 || height <= 0) return;
     if (grr->surfaceWidth[surfaceID] == width && grr->surfaceHeight[surfaceID] == height) return;
@@ -2014,6 +2100,7 @@ static void grrSurfaceResize(Renderer* renderer, int32_t surfaceID, int32_t widt
 static void grrSurfaceFree(Renderer* renderer, int32_t surfaceID)
 {
     GRRRenderer* grr = (GRRRenderer*)renderer;
+    if (surfaceID == APPLICATION_SURFACE_ID) return;
     if (surfaceID < 0 || (uint32_t)surfaceID >= grr->surfaceCount) return;
     free(grr->surfaceBuffers[surfaceID]);
     grr->surfaceBuffers[surfaceID] = NULL;
@@ -2026,6 +2113,7 @@ static void grrSurfaceFree(Renderer* renderer, int32_t surfaceID)
 static bool grrSurfaceExists(Renderer* renderer, int32_t surfaceId)
 {
     GRRRenderer* grr = (GRRRenderer*)renderer;
+    if (surfaceId == APPLICATION_SURFACE_ID) return true;
     return surfaceId >= 0
         && (uint32_t)surfaceId < grr->surfaceCount
         && grr->surfaceBuffers[surfaceId] != NULL;
@@ -2034,6 +2122,7 @@ static bool grrSurfaceExists(Renderer* renderer, int32_t surfaceId)
 static bool grrSurfaceGetPixels(Renderer* renderer, int32_t surfaceId, uint8_t* outRGBA)
 {
     GRRRenderer* grr = (GRRRenderer*)renderer;
+    if (surfaceId == APPLICATION_SURFACE_ID) return false;
     if (surfaceId < 0 || (uint32_t)surfaceId >= grr->surfaceCount) return false;
     if (!grr->surfaceBuffers[surfaceId]) return false;
     int32_t w = grr->surfaceWidth[surfaceId], h = grr->surfaceHeight[surfaceId];
@@ -2077,6 +2166,7 @@ static void grrSurfaceCopy(
     int32_t SrcW,   int32_t SrcH,  bool part)
 {
     GRRRenderer* grr = (GRRRenderer*)renderer;
+    if (SrcID == APPLICATION_SURFACE_ID || DestID == APPLICATION_SURFACE_ID) return;
     if (SrcID  < 0 || (uint32_t)SrcID  >= grr->surfaceCount) return;
     if (DestID < 0 || (uint32_t)DestID >= grr->surfaceCount) return;
 
@@ -2129,6 +2219,11 @@ static void grrSurfaceCopy(
 static float grrGetSurfaceWidth(Renderer* renderer, int32_t surfaceId)
 {
     GRRRenderer* grr = (GRRRenderer*)renderer;
+    if (surfaceId == APPLICATION_SURFACE_ID) {
+        if (renderer->runner != NULL && renderer->runner->applicationWidth > 0)
+            return (float)renderer->runner->applicationWidth;
+        return (float)(grr->gameW > 0 ? grr->gameW : g_wiiRmode->fbWidth);
+    }
     if (surfaceId < 0 || (uint32_t)surfaceId >= grr->surfaceCount) return 0.0f;
     return (float)grr->surfaceWidth[surfaceId];
 }
@@ -2136,6 +2231,11 @@ static float grrGetSurfaceWidth(Renderer* renderer, int32_t surfaceId)
 static float grrGetSurfaceHeight(Renderer* renderer, int32_t surfaceId)
 {
     GRRRenderer* grr = (GRRRenderer*)renderer;
+    if (surfaceId == APPLICATION_SURFACE_ID) {
+        if (renderer->runner != NULL && renderer->runner->applicationHeight > 0)
+            return (float)renderer->runner->applicationHeight;
+        return (float)(grr->gameH > 0 ? grr->gameH : g_wiiRmode->efbHeight);
+    }
     if (surfaceId < 0 || (uint32_t)surfaceId >= grr->surfaceCount) return 0.0f;
     return (float)grr->surfaceHeight[surfaceId];
 }
@@ -2274,7 +2374,7 @@ static int32_t findSurfaceStackTop(GRRRenderer* grr) {
     return -1;
 }
 
-static bool grrSetRenderTarget(Renderer* renderer, int32_t surfaceId)
+static bool grrBindRenderTarget(Renderer* renderer, int32_t surfaceId)
 {
     GRRRenderer* grr = (GRRRenderer*)renderer;
     if (surfaceId >= 0) {
@@ -2317,7 +2417,7 @@ static bool grrSetSurfaceTarget(Renderer* renderer, int32_t surfaceId)
     }
     return true;
 #else
-    return grrSetRenderTarget(renderer, surfaceId);
+    return grrBindRenderTarget(renderer, surfaceId);
 #endif
 }
 
@@ -2338,8 +2438,38 @@ static bool grrResetSurfaceTarget(Renderer* renderer)
     }
     return true;
 #else
-    return grrSetRenderTarget(renderer, top != -1 ? grr->surfaceStack[top] : -1);
+    return grrBindRenderTarget(renderer, top != -1 ? grr->surfaceStack[top] : -1);
 #endif
+}
+
+static bool grrSetRenderTarget(Renderer* renderer, int32_t surfaceId)
+{
+    GRRRenderer* grr = (GRRRenderer*)renderer;
+    if (surfaceId == APPLICATION_SURFACE_ID) {
+#if !WII_GX_ENABLE_SURFACE_CAPTURE
+        return true;
+#else
+        return grrBindRenderTarget(renderer, -1);
+#endif
+    }
+
+    if (surfaceId < 0 || (uint32_t)surfaceId >= grr->surfaceCount || !grr->surfaceBuffers[surfaceId])
+        return false;
+
+#if !WII_GX_ENABLE_SURFACE_CAPTURE
+    if (g_wiiSurfaceTargetLogCount < 8) {
+        fprintf(stderr, "GRR: Surface target %d requested; passing through to EFB on Wii\n", surfaceId);
+        g_wiiSurfaceTargetLogCount++;
+    }
+    return true;
+#else
+    return grrBindRenderTarget(renderer, surfaceId);
+#endif
+}
+
+static int32_t grrEnsureApplicationSurface(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t width, MAYBE_UNUSED int32_t height)
+{
+    return APPLICATION_SURFACE_ID;
 }
 
 // ===================================================================
@@ -2421,7 +2551,11 @@ static void grrBeginFrame(Renderer* renderer, int32_t gameW, int32_t gameH,
     grrConfigureGXState();
 }
 
-static void grrEndFrame(Renderer* renderer)
+static void grrEndFrameInit(MAYBE_UNUSED Renderer* renderer)
+{
+}
+
+static void grrEndFrameEnd(Renderer* renderer)
 {
     GRRRenderer* grr = (GRRRenderer*)renderer;
     g_wiiLastFrameQuads = g_wiiFrameQuads;
@@ -2590,6 +2724,11 @@ static void grrGpuSetBlendEnable(Renderer* renderer, bool enable)
     }
 }
 
+static bool grrGpuGetBlendEnable(MAYBE_UNUSED Renderer* renderer)
+{
+    return true;
+}
+
 static void grrGpuSetAlphaTestEnable(Renderer* renderer, bool enable)
 {
     GRRRenderer* grr = (GRRRenderer*)renderer;
@@ -2610,6 +2749,14 @@ static void grrGpuSetColorWriteEnable(Renderer* renderer, bool red, bool green, 
 {
     GX_SetColorUpdate(red || green || blue);
     GX_SetAlphaUpdate(alpha);
+}
+
+static void grrGpuGetColorWriteEnable(MAYBE_UNUSED Renderer* renderer, bool* red, bool* green, bool* blue, bool* alpha)
+{
+    if (red) *red = true;
+    if (green) *green = true;
+    if (blue) *blue = true;
+    if (alpha) *alpha = true;
 }
 
 static void grrGpuSetFog(Renderer* renderer, bool enable, uint32_t color)
@@ -2761,22 +2908,24 @@ static RendererVtable grrVtable = {
     .init                = grrInit,
     .destroy             = grrDestroy,
     .beginFrame          = grrBeginFrame,
-    .endFrame            = grrEndFrame,
+    .endFrameInit        = grrEndFrameInit,
+    .endFrameEnd         = grrEndFrameEnd,
     .drawSprite          = grrDrawSprite,
     .drawSpritePart      = grrDrawSpritePart,
     .drawSpritePos       = grrDrawSpritePos,
     .drawRectangle       = grrDrawRectangle,
+    .drawRectangleColor  = grrDrawRectangleColor,
     .drawLine            = grrDrawLine,
     .drawLineColor       = grrDrawLineColor,
     .drawTriangle        = grrDrawTriangle,
     .drawText            = grrDrawText,
     .drawTextColor       = grrDrawTextColor,
     .drawSurface         = grrDrawSurface,
-    .drawSurfacePart     = grrDrawSurfacePart,
-    .drawSurfaceStretched= grrDrawSurfaceStretched,
     .createSpriteFromSurface = grrCreateSpriteFromSurface,
     .createSurface       = grrCreateSurface,
     .surfaceExists       = grrSurfaceExists,
+    .setRenderTarget     = grrSetRenderTarget,
+    .ensureApplicationSurface = grrEnsureApplicationSurface,
     .deleteSprite        = grrDeleteSprite,
     .clearScreen         = grrClearScreen,
     .beginView           = grrBeginView,
@@ -2787,13 +2936,13 @@ static RendererVtable grrVtable = {
     .gpuSetBlendMode     = grrGpuSetBlendMode,
     .gpuSetBlendModeExt  = grrGpuSetBlendModeExt,
     .gpuSetBlendEnable   = grrGpuSetBlendEnable,
+    .gpuGetBlendEnable   = grrGpuGetBlendEnable,
     .gpuSetAlphaTestEnable = grrGpuSetAlphaTestEnable,
     .gpuSetAlphaTestRef  = grrGpuSetAlphaTestRef,
     .gpuSetColorWriteEnable = grrGpuSetColorWriteEnable,
+    .gpuGetColorWriteEnable = grrGpuGetColorWriteEnable,
     .gpuSetFog           = grrGpuSetFog,
     .surfaceGetPixels    = grrSurfaceGetPixels,
-    .setSurfaceTarget    = grrSetSurfaceTarget,
-    .resetSurfaceTarget  = grrResetSurfaceTarget,
     .surfaceCopy         = grrSurfaceCopy,
     .getSurfaceWidth     = grrGetSurfaceWidth,
     .getSurfaceHeight    = grrGetSurfaceHeight,
