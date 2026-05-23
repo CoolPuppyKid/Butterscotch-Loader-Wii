@@ -27,83 +27,12 @@
 
 #define fprintf(stream, ...) WiiLog_fprintf((stream), __VA_ARGS__)
 
+static const char* kDataWinPath = "sd:/butterscotch/DATA.WIN";
+
 static bool g_sdWritable = false;
 static uint32_t g_dbgStepMs = 0;
 static uint32_t g_dbgDrawMs = 0;
 static uint32_t g_dbgCapMs = 0;
-
-static bool pathHasDevicePrefix(const char* path)
-{
-    return path != NULL && strstr(path, ":/") != NULL;
-}
-
-static bool getLaunchDirectory(const char* argv0, char* outDir, size_t outDirSize)
-{
-    if (!argv0 || !pathHasDevicePrefix(argv0) || outDirSize == 0)
-        return false;
-
-    const char* slash = strrchr(argv0, '/');
-    if (!slash)
-        return false;
-
-    size_t len = (size_t)(slash - argv0 + 1);
-    if (len >= outDirSize)
-        len = outDirSize - 1;
-
-    memcpy(outDir, argv0, len);
-    outDir[len] = '\0';
-    return true;
-}
-
-static bool getDeviceRoot(const char* path, char* outRoot, size_t outRootSize)
-{
-    if (!path || !outRoot || outRootSize == 0)
-        return false;
-
-    const char* marker = strstr(path, ":/");
-    if (!marker)
-        return false;
-
-    size_t len = (size_t)(marker - path + 2);
-    if (len >= outRootSize)
-        len = outRootSize - 1;
-
-    memcpy(outRoot, path, len);
-    outRoot[len] = '\0';
-    return true;
-}
-
-static void addDataWinCandidate(char candidates[][256], int* count, int maxCount, const char* path)
-{
-    if (!path || !*path || *count >= maxCount)
-        return;
-
-    for (int i = 0; i < *count; i++) {
-        if (strcmp(candidates[i], path) == 0)
-            return;
-    }
-
-    snprintf(candidates[*count], 256, "%s", path);
-    (*count)++;
-}
-
-static void addDataWinCandidatePair(char candidates[][256], int* count, int maxCount, const char* dir)
-{
-    char path[256];
-    size_t len = strlen(dir);
-    const char* sep = (len > 0 && dir[len - 1] == '/') ? "" : "/";
-    snprintf(path, sizeof(path), "%s%sDATA.WIN", dir, sep);
-    addDataWinCandidate(candidates, count, maxCount, path);
-    snprintf(path, sizeof(path), "%s%sdata.win", dir, sep);
-    addDataWinCandidate(candidates, count, maxCount, path);
-}
-
-static void addDataWinDeviceCandidates(char candidates[][256], int* count, int maxCount, const char* root)
-{
-    char dir[256];
-    snprintf(dir, sizeof(dir), "%sbutterscotch/", root);
-    addDataWinCandidatePair(candidates, count, maxCount, dir);
-}
 
 static bool getDirectoryName(const char* path, char* outDir, size_t outDirSize)
 {
@@ -379,34 +308,6 @@ static void fatalError(const char* msg)
     fatalErrorLoop(lines, 2);
 }
 
-static void fatalErrorForCandidates(const char* msg, const char* const* paths, int pathCount)
-{
-    enum { MAX_LINES = 18 };
-    char lineStorage[MAX_LINES][96];
-    const char* lines[MAX_LINES];
-    int lineCount = 0;
-
-    for (int i = 0; i < MAX_LINES; i++)
-        lines[i] = lineStorage[i];
-
-    snprintf(lineStorage[lineCount++], sizeof(lineStorage[0]), "%s", msg);
-    snprintf(lineStorage[lineCount++], sizeof(lineStorage[0]), "TRIED:");
-
-    for (int i = 0; i < pathCount && lineCount < MAX_LINES - 1; i++) {
-        FILE* f = fopen(paths[i], "rb");
-        if (f) {
-            fclose(f);
-            snprintf(lineStorage[lineCount++], sizeof(lineStorage[0]), "OK %.87s", paths[i]);
-        } else {
-            snprintf(lineStorage[lineCount++], sizeof(lineStorage[0]), "NO %.87s", paths[i]);
-        }
-    }
-
-    snprintf(lineStorage[lineCount++], sizeof(lineStorage[0]), "PRESS HOME TO EXIT");
-    fprintf(stderr, "FATAL: %s\n", msg);
-    fatalErrorLoop(lines, lineCount);
-}
-
 static void loadingStep(int phase, int totalPhases, const char* status)
 {
     WiiGX_drawLoadingStatus(phase, totalPhases, status);
@@ -426,6 +327,8 @@ static void dataWinLogProgressCallback(const char* chunkName, int chunkIndex, in
 // =========================================================================
 
 int main(int argc, char* argv[]) {
+    (void)argc;
+    (void)argv;
     WiiGX_initVideo();
     loadingStep(0, 10, "STARTING");
 
@@ -453,49 +356,15 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "Audio disabled for this Wii build\n");
 #endif
 
-    // DATA.WIN. Prefer the same device/directory that launched the DOL.
-    // Real hardware can stall when probing an absent device; Dolphin usually does not.
-    enum { DATA_WIN_MAX_CANDIDATES = 16 };
-    char dataWinCandidateStorage[DATA_WIN_MAX_CANDIDATES][256];
-    const char* dataWinCandidates[DATA_WIN_MAX_CANDIDATES];
-    int dataWinCandidateCount = 0;
-    char launchDir[256];
-    char launchRoot[32];
-
-    addDataWinCandidatePair(dataWinCandidateStorage, &dataWinCandidateCount, DATA_WIN_MAX_CANDIDATES, ".");
-
-    if (getLaunchDirectory(argc > 0 ? argv[0] : NULL, launchDir, sizeof(launchDir))) {
-        addDataWinCandidatePair(dataWinCandidateStorage, &dataWinCandidateCount, DATA_WIN_MAX_CANDIDATES, launchDir);
-        if (getDeviceRoot(launchDir, launchRoot, sizeof(launchRoot)))
-            addDataWinDeviceCandidates(dataWinCandidateStorage, &dataWinCandidateCount, DATA_WIN_MAX_CANDIDATES, launchRoot);
-    }
-
-    addDataWinDeviceCandidates(dataWinCandidateStorage, &dataWinCandidateCount, DATA_WIN_MAX_CANDIDATES, "usb:/");
-    addDataWinDeviceCandidates(dataWinCandidateStorage, &dataWinCandidateCount, DATA_WIN_MAX_CANDIDATES, "sd:/");
-
-    for (int i = 0; i < dataWinCandidateCount; i++)
-        dataWinCandidates[i] = dataWinCandidateStorage[i];
-
-    const char* dataWinPath = NULL;
-    FILE* dataWinProbe = NULL;
-
     loadingStep(4, 10, "OPEN DATA.WIN");
-    for (int i = 0; i < dataWinCandidateCount; i++) {
-        char status[96];
-        snprintf(status, sizeof(status), "TRY %.86s", dataWinCandidates[i]);
-        loadingStep(4, 10, status);
-        dataWinProbe = fopen(dataWinCandidates[i], "rb");
-        if (dataWinProbe) {
-            dataWinPath = dataWinCandidates[i];
-            break;
-        }
-    }
+    FILE* dataWinProbe = fopen(kDataWinPath, "rb");
     if (!dataWinProbe) {
-        fatalErrorForCandidates("DATA.WIN could not be opened", dataWinCandidates, dataWinCandidateCount);
+        fatalError("DATA.WIN could not be opened at sd:/butterscotch/DATA.WIN");
     }
+    fclose(dataWinProbe);
 
     char dataWinDir[256];
-    getDirectoryName(dataWinPath, dataWinDir, sizeof(dataWinDir));
+    getDirectoryName(kDataWinPath, dataWinDir, sizeof(dataWinDir));
     logDirectoryListing(dataWinDir);
 
     char saveDir[256];
@@ -509,11 +378,11 @@ int main(int argc, char* argv[]) {
 
     openLogFile(dataWinDir);
     fprintf(stderr, "FAT initialized (%s)\n", g_sdWritable ? "read/write" : "read-only");
-    fprintf(stderr, "Loading %s\n", dataWinPath);
+    fprintf(stderr, "Loading %s\n", kDataWinPath);
 
     loadingStep(5, 10, "PARSE DATA.WIN");
 
-    DataWin* dataWin = DataWin_parse(dataWinPath,
+    DataWin* dataWin = DataWin_parse(kDataWinPath,
         (DataWinParserOptions){
             .parseGen8=true,.parseOptn=true,.parseLang=true,.parseExtn=false,
             .parseSond=true,.parseAgrp=true,.parseSprt=true,.parseBgnd=true,
@@ -530,7 +399,7 @@ int main(int argc, char* argv[]) {
             dataWin->txtr.count, dataWin->sprt.count);
     loadingStep(6, 10, "CREATE FILE SYSTEM");
 
-    FileSystem* fileSystem = WiiFileSystem_createDefault(dataWin->gen8.displayName, dataWinPath, g_sdWritable);
+    FileSystem* fileSystem = WiiFileSystem_createDefault(dataWin->gen8.displayName, kDataWinPath, g_sdWritable);
     loadingStep(7, 10, "CREATE VM");
 
     VMContext* vm = VM_create(dataWin);
