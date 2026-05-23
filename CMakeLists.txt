@@ -161,6 +161,7 @@ if(PLATFORM STREQUAL "wii")
 
     target_compile_options(butterscotch PRIVATE
         -mrvl -mcpu=750 -meabi -mhard-float
+        -O2
         -fsingle-precision-constant -Werror=double-promotion
         -fomit-frame-pointer -ffast-math
     )

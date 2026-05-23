@@ -48,7 +48,7 @@ Of course, there are exceptions that break game compatibility altogether:
 Make sure you have ``$DEVKITPRO`` set before building, Cause like its a important library for the Wii
 
 ```bash
-cmake -B build -DPLATFORM=wii
+cmake -B build/wii -DPLATFORM=wii -DCMAKE_TOOLCHAIN_FILE=cmake/wii.cmake
 cmake --build build
 ```
 
