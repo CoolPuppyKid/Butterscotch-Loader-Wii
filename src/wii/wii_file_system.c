@@ -1,6 +1,7 @@
 #include "wii_file_system.h"
 #include "../json_reader.h"
 #include "../utils.h"
+#include "wii_embedded_data.h"
 #include "wii_log.h"
 #include <stdio.h>
 #include <string.h>
@@ -151,14 +152,14 @@ static bool wiiFileExists(FileSystem* fs, const char* relativePath) {
         long size = 0;
         bool exists = getReadableFileSize(fallback, &size);
         free(fallback);
-        return exists;
+        return exists || WiiEmbeddedData_find(relativePath) != NULL;
     }
     char** arr = wfs->mappings[idx].value;
     for (int i = 0; i < arrlen(arr); i++) {
         long size = 0;
         if (getReadableFileSize(arr[i], &size)) return true;
     }
-    return false;
+    return WiiEmbeddedData_find(relativePath) != NULL;
 }
 
 static bool wiiReadFileBinary(FileSystem* fs, const char* relativePath, uint8_t** outData, int32_t* outSize) {
@@ -168,13 +169,14 @@ static bool wiiReadFileBinary(FileSystem* fs, const char* relativePath, uint8_t*
         char* fallback = expandBasePrefix(wfs, relativePath);
         bool ok = readBinaryPath(fallback, outData, outSize);
         free(fallback);
-        return ok;
+        if (ok) return true;
+        return WiiEmbeddedData_readBinary(relativePath, outData, outSize);
     }
     char** arr = wfs->mappings[idx].value;
     for (int i = 0; i < arrlen(arr); i++) {
         if (readBinaryPath(arr[i], outData, outSize)) return true;
     }
-    return false;
+    return WiiEmbeddedData_readBinary(relativePath, outData, outSize);
 }
 
 static char* wiiReadFileText(FileSystem* fs, const char* relativePath) {

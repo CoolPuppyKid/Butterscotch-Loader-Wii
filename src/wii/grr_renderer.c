@@ -50,6 +50,8 @@ typedef struct {
     Sprite* spriteFontSprite;   // for sprite fonts, NULL otherwise
 } GrrFontState;
 
+static WiiTexture* grrCreateTextureFromRgba(const uint8_t* pixels, int32_t w, int32_t h);
+
 static WiiTexture* WiiTexture_create(u32 w, u32 h)
 {
     WiiTexture* tex = safeCalloc(1, sizeof(WiiTexture));
@@ -74,7 +76,7 @@ void WiiGX_initVideo(void)
     g_wiiXfb[0] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(g_wiiRmode));
     g_wiiXfb[1] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(g_wiiRmode));
 
-    console_init(g_wiiXfb[g_wiiFb], 20, 20, g_wiiRmode->fbWidth, g_wiiRmode->xfbHeight, g_wiiRmode->fbWidth * VI_DISPLAY_PIX_SZ);
+    //console_init(g_wiiXfb[g_wiiFb], 20, 20, g_wiiRmode->fbWidth, g_wiiRmode->xfbHeight, g_wiiRmode->fbWidth * VI_DISPLAY_PIX_SZ);
 
     VIDEO_Configure(g_wiiRmode);
     VIDEO_SetNextFramebuffer(g_wiiXfb[g_wiiFb]);
@@ -633,7 +635,7 @@ void WiiGX_drawLoadingStatus(int phase, int totalPhases, const char* status)
     int barY = (int)sh / 2 - barH / 2;
     int filled = (barW * phase) / totalPhases;
 
-    emitLoadingRect(0, 0, sw, sh, (GXColor){17, 17, 17, 255});
+    emitLoadingRect(0, 0, sw, sh, (GXColor){0, 0, 0, 255});
     if (status && status[0]) {
         int textScale = 2;
         int maxChars = barW / (6 * textScale);
@@ -643,7 +645,7 @@ void WiiGX_drawLoadingStatus(int phase, int totalPhases, const char* status)
         drawLoadingText((sw - textW) * 0.5f, (float)(barY - 34), status, textScale, (GXColor){220, 220, 220, 255});
     }
     emitLoadingRect(barX - 2, barY - 2, barX + barW + 2, barY + barH + 2, (GXColor){102, 102, 102, 255});
-    emitLoadingRect(barX, barY, barX + barW, barY + barH, (GXColor){17, 17, 17, 255});
+    emitLoadingRect(barX, barY, barX + barW, barY + barH, (GXColor){0, 0, 0, 255});
     if (filled > 0) {
         emitLoadingRect(barX, barY, barX + filled, barY + barH, (GXColor){173, 68, 204, 255});
     }
@@ -695,6 +697,85 @@ void WiiGX_drawTextScreen(const char* title, const char* const* lines, int lineC
     VIDEO_Flush();
     g_wiiFb ^= 1;
     VIDEO_WaitVSync();
+}
+
+void WiiGX_beginFrame2D(void)
+{
+    grrConfigureGXState();
+    useColorOnlyTev();
+
+    Mtx44 proj;
+    guOrtho(proj, 0.0f, (f32)g_wiiRmode->efbHeight, 0.0f, (f32)g_wiiRmode->fbWidth, -1.0f, 1.0f);
+    GX_LoadProjectionMtx(proj, GX_ORTHOGRAPHIC);
+    Mtx mv;
+    guMtxIdentity(mv);
+    GX_LoadPosMtxImm(mv, GX_PNMTX0);
+}
+
+void WiiGX_presentFrame(void)
+{
+    GX_DrawDone();
+    GX_CopyDisp(g_wiiXfb[g_wiiFb], GX_TRUE);
+    VIDEO_SetNextFramebuffer(g_wiiXfb[g_wiiFb]);
+    VIDEO_Flush();
+    g_wiiFb ^= 1;
+    VIDEO_WaitVSync();
+}
+
+void WiiGX_useColorOnly(void)
+{
+    useColorOnlyTev();
+}
+
+void WiiGX_useTexture(WiiTexture* tex)
+{
+    if (!tex) {
+        useColorOnlyTev();
+        return;
+    }
+    loadTex(tex);
+}
+
+void WiiGX_drawRect(float x0, float y0, float x1, float y1, GXColor color)
+{
+    emitLoadingRect(x0, y0, x1, y1, color);
+}
+
+void WiiGX_drawTextureRect(WiiTexture* tex, float x, float y, float w, float h, GXColor color)
+{
+    if (!tex || !tex->data || w <= 0.0f || h <= 0.0f) return;
+    loadTex(tex);
+    emitQuad(x, y, x + w, y, x + w, y + h, x, y + h, 0.0f, 0.0f, 1.0f, 1.0f, color.r, color.g, color.b, color.a);
+}
+
+void WiiGX_drawBitmapText(float x, float y, const char* text, int scale, GXColor color)
+{
+    drawLoadingText(x, y, text, scale, color);
+}
+
+void WiiGX_measureBitmapText(const char* text, int scale, float* outWidth, float* outHeight)
+{
+    float width = 0.0f;
+    float height = 0.0f;
+
+    if (scale > 0 && text && text[0]) {
+        width = (float)(int)strlen(text) * (float)(6 * scale);
+        height = (float)(7 * scale);
+    }
+
+    if (outWidth) *outWidth = width;
+    if (outHeight) *outHeight = height;
+}
+
+WiiTexture* WiiGX_createTextureFromRgba(const uint8_t* pixels, int32_t w, int32_t h)
+{
+    if (!pixels || w <= 0 || h <= 0) return NULL;
+    return grrCreateTextureFromRgba(pixels, w, h);
+}
+
+void WiiGX_destroyTexture(WiiTexture* tex)
+{
+    WiiTexture_free(tex);
 }
 
 void WiiGX_setDebugOverlay(const char* line1, const char* line2)

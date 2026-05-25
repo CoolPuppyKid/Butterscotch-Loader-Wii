@@ -10,6 +10,12 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 add_compile_options(-Wall -Wextra)
 
+file(GLOB_RECURSE BUTTERSCOTCH_DATA_FILES CONFIGURE_DEPENDS RELATIVE "${CMAKE_SOURCE_DIR}/data" "${CMAKE_SOURCE_DIR}/data/*")
+set(BUTTERSCOTCH_DATA_DEPENDS "")
+foreach(data_file IN LISTS BUTTERSCOTCH_DATA_FILES)
+    list(APPEND BUTTERSCOTCH_DATA_DEPENDS "${CMAKE_SOURCE_DIR}/data/${data_file}")
+endforeach()
+
 set(PLATFORM "" CACHE STRING "Platform backend")
 set(AUDIO_BACKEND "" CACHE STRING "Audio backend")
 
@@ -146,6 +152,25 @@ if(PLATFORM STREQUAL "wii")
     file(GLOB IMAGE_SOURCES src/image/*.c)
     target_sources(butterscotch PRIVATE ${IMAGE_SOURCES})
 
+    set(WII_EMBEDDED_DATA_C "${CMAKE_CURRENT_BINARY_DIR}/generated/wii_embedded_data_blob.c")
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    add_custom_command(
+        OUTPUT "${WII_EMBEDDED_DATA_C}"
+        COMMAND ${CMAKE_COMMAND}
+            -DINPUT_ROOT=${CMAKE_SOURCE_DIR}/data
+            -DOUTPUT_C=${WII_EMBEDDED_DATA_C}
+            "-DFILE_LIST=${BUTTERSCOTCH_DATA_FILES}"
+            -P ${CMAKE_SOURCE_DIR}/cmake/embed_directory.cmake
+        DEPENDS ${CMAKE_SOURCE_DIR}/cmake/embed_directory.cmake
+        ${BUTTERSCOTCH_DATA_DEPENDS}
+        COMMENT "Embedding data/ into Wii binary"
+        VERBATIM
+    )
+    target_sources(butterscotch PRIVATE
+        src/wii/wii_embedded_data.c
+        "${WII_EMBEDDED_DATA_C}"
+    )
+
     add_compile_definitions(PLATFORM_WII)
     add_compile_definitions(USE_FLOAT_REALS)
     add_compile_definitions(NO_RVALUE_INT64)
@@ -171,6 +196,7 @@ if(PLATFORM STREQUAL "wii")
         $ENV{DEVKITPRO}/portlibs/ppc/include
         $ENV{DEVKITPRO}/portlibs/wii/include
         ${CMAKE_SOURCE_DIR}/src/image
+        ${CMAKE_CURRENT_BINARY_DIR}/generated
     )
     target_link_directories(butterscotch PRIVATE
         $ENV{DEVKITPRO}/libogc/lib/wii
