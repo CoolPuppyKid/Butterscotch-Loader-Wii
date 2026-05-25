@@ -753,6 +753,11 @@ void WiiGX_drawBitmapText(float x, float y, const char* text, int scale, GXColor
     drawLoadingText(x, y, text, scale, color);
 }
 
+void WiiGX_drawBitmapTextAlpha(float x, float y, const char* text, int scale, uint8_t r, uint8_t g, uint8_t b, float alpha)
+{
+    drawLoadingText(x, y, text, scale, (GXColor){r, g, b, grrAlphaToU8(alpha)});
+}
+
 void WiiGX_measureBitmapText(const char* text, int scale, float* outWidth, float* outHeight)
 {
     float width = 0.0f;
@@ -1433,7 +1438,10 @@ static void grrDrawSprite(
     g_wiiFrameSpriteDraws++;
 
     uint8_t r = BGR_R(color), g = BGR_G(color), b = BGR_B(color);
-    uint8_t a = grrAlphaToU8(alpha);
+    float combinedAlpha = alpha * renderer->drawAlpha;
+    if (combinedAlpha < 0.0f) combinedAlpha = 0.0f;
+    if (combinedAlpha > 1.0f) combinedAlpha = 1.0f;
+    uint8_t a = grrAlphaToU8(combinedAlpha);
 
     loadTex(tex);
     emitQuad(wx0, wy0, wx1, wy1, wx2, wy2, wx3, wy3,
@@ -2559,7 +2567,7 @@ static int32_t grrEnsureApplicationSurface(MAYBE_UNUSED Renderer* renderer, MAYB
 
 static void grrDrawLoadIndicator(GRRRenderer* grr)
 {
-    if (grr->loadIndicatorFrames == 0) return;
+    /*if (grr->loadIndicatorFrames == 0) return;
 
     grrConfigureGXState();
     useColorOnlyTev();
@@ -2581,7 +2589,9 @@ static void grrDrawLoadIndicator(GRRRenderer* grr)
     emitLoadingRect(x, y, x + w, y + h, (GXColor){55, 55, 55, 220});
     emitLoadingRect(x, y, x + w * usage, y + h, (GXColor){130, 210, 80, 240});
 
-    grr->loadIndicatorFrames--;
+    grr->loadIndicatorFrames--;*/
+    (void)grr;
+    return;
 }
 
 #if WII_GX_DEBUG_OVERLAY

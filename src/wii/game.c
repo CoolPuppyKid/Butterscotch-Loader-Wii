@@ -346,7 +346,7 @@ int WiiGame_run(const WiiLaunchEntry* entry, bool audioEnabled)
             .parseTpag=true,.parseCode=true,.parseVari=true,.parseFunc=true,
             .parseStrg=true,.parseTxtr=true,.parseAudo=false,
             .skipLoadingPreciseMasksForNonPreciseSprites=true,
-            .lazyLoadRooms=false,.lazyLoadTextureData=true,.eagerlyLoadedRooms=NULL,
+            .lazyLoadRooms=true,.lazyLoadTextureData=true,.eagerlyLoadedRooms=NULL,
             .progressCallback=dataWinLogProgressCallback,.progressCallbackUserData=NULL,
         });
     if (!dataWin) fatalError("Failed to parse DATA.WIN. Check butterscotch.log.");

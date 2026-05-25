@@ -32,6 +32,7 @@ void WiiGX_useTexture(WiiTexture* tex);
 void WiiGX_drawRect(float x0, float y0, float x1, float y1, GXColor color);
 void WiiGX_drawTextureRect(WiiTexture* tex, float x, float y, float w, float h, GXColor color);
 void WiiGX_drawBitmapText(float x, float y, const char* text, int scale, GXColor color);
+void WiiGX_drawBitmapTextAlpha(float x, float y, const char* text, int scale, uint8_t r, uint8_t g, uint8_t b, float alpha);
 void WiiGX_measureBitmapText(const char* text, int scale, float* outWidth, float* outHeight);
 WiiTexture* WiiGX_createTextureFromRgba(const uint8_t* pixels, int32_t w, int32_t h);
 void WiiGX_destroyTexture(WiiTexture* tex);

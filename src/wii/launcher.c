@@ -443,10 +443,17 @@ bool WiiLauncher_selectGame(WiiLaunchEntry* outEntry)
         int previousSelected = selected;
         if ((down & WPAD_BUTTON_LEFT) && selected > 0)
             selected--;
+        else if (down & WPAD_BUTTON_LEFT)
+            selected = arrlen(entries) - 1;
+
         if ((down & WPAD_BUTTON_RIGHT) && selected + 1 < arrlen(entries))
             selected++;
+        else if (down & WPAD_BUTTON_RIGHT)
+            selected = 0;
+
         if (selected != previousSelected)
             playLauncherSound(WII_LAUNCHER_SOUND_SELECT);
+            
         if (down & (WPAD_BUTTON_A | WPAD_BUTTON_2 | WPAD_BUTTON_PLUS)) {
             *outEntry = entries[selected];
             arrdel(entries, selected);
