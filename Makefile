@@ -4,7 +4,6 @@
 CC := cc
 
 CFLAGS := -O2 -DNDEBUG
-LIBS := -lbz2
 
 OS := $(shell uname -s)
 
@@ -12,10 +11,10 @@ DEFINES := -DENABLE_VM_GML_PROFILER \
 		   -DENABLE_VM_OPCODE_PROFILER \
 		   -DENABLE_VM_STUB_LOGS \
 		   -DENABLE_VM_TRACING
-INCLUDES := -I. -Isrc -Ivendor/stb/ds -Isrc/image -Ivendor/stb/image -Ivendor/stb/vorbis -Ivendor/md5 -Ivendor/sha1 -Ivendor/base64
+INCLUDES := -I. -Isrc -Ivendor/stb/ds -Isrc/image -Ivendor/stb/image -Ivendor/stb/vorbis -Ivendor/md5 -Ivendor/sha1 -Ivendor/base64 -Ivendor/bzip2
 
 HEADERS := $(wildcard src/*.h) $(shell find vendor -name '*.h')
-SRCS := $(wildcard src/*.c) $(wildcard src/image/*.c) vendor/md5/md5.c vendor/sha1/sha1.c vendor/base64/base64.c
+SRCS := $(wildcard src/*.c) $(wildcard src/image/*.c) $(wildcard vendor/bzip2/*.c) vendor/md5/md5.c vendor/sha1/sha1.c vendor/base64/base64.c
 
 PLATFORM := glfw
 AUDIO_BACKEND := miniaudio
@@ -31,16 +30,16 @@ else
 DEFINES += -DBUTTERSCOTCH_COMMIT_HASH=\"unknown\"
 endif
 
-ifndef DISABLE_BC14
-DEFINES += -DENABLE_BC14
+ifndef DISABLE_WAD14
+DEFINES += -DENABLE_WAD14
 endif
 
-ifndef DISABLE_BC16
-DEFINES += -DENABLE_BC16
+ifndef DISABLE_WAD16
+DEFINES += -DENABLE_WAD16
 endif
 
-ifndef DISABLE_BC17
-DEFINES += -DENABLE_BC17
+ifndef DISABLE_WAD17
+DEFINES += -DENABLE_WAD17
 endif
 
 # GNU make doesn't have a way to do OR in conditionals, stupid language for clowns
@@ -76,9 +75,9 @@ HEADERS += $(wildcard src/gl/*.h)
 endif
 endif
 
-ifdef DISABLE_BC14
-ifdef DISABLE_BC16
-ifdef DISABLE_BC17
+ifdef DISABLE_WAD14
+ifdef DISABLE_WAD16
+ifdef DISABLE_WAD17
 $(error must enable at least 1 bytecode version)
 endif
 endif

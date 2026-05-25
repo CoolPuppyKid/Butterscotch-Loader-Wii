@@ -17,17 +17,25 @@ So i wanted the name to be more similar to USB Loader GX.
 
 ## Game Compatibility
 
-Butterscotch's goal is to be able to have Undertale v1.08 (GameMaker: Studio 1.4.1804, Bytecode Version 16) fully playable. But we do want to support more GameMaker: Studio games in the future too!
+Butterscotch's goal is to be able to have Undertale v1.08 (GameMaker: Studio 1.4.1804, WAD Version 16) fully playable. But we do want to support more GameMaker: Studio games in the future too!
 
 While our target is Undertale v1.08, that doesn't mean that other games CAN'T run in Butterscotch! Because Butterscotch is a runner and not a Undertale port/remake, you CAN run other GameMaker: Studio games with it and, as long as the game is compiled with GameMaker: Studio 1.4.1804 and they only use GML variables and functions that Butterscotch supports, it should work fine.
 
-Butterscotch supports the following bytecode versions:
+Butterscotch supports the following WAD versions:
 
-* Bytecode Version 13
-* Bytecode Version 14
-* Bytecode Version 15
-* Bytecode Version 16
-* Bytecode Version 17
+* WAD Version 8 (GameMaker: Studio 1.0.198+)
+* WAD Version 10 (GameMaker: Studio 1.1.622+)
+* WAD Version 11 (GameMaker: Studio 1.1.827+)
+* WAD Version 12 (GameMaker: Studio 1.1.867+)
+* WAD Version 13
+* WAD Version 14
+* WAD Version 15
+* WAD Version 16
+* WAD Version 17 (GameMaker: Studio 2.2+)
+
+Other modding tools, such as UndertaleModTool, calls it "bytecode version" instead of "WAD version". We decided to go with WAD version instead because there are GameMaker: Studio versions (WAD version 6 and 7) that DO NOT use bytecode altogether, so calling it "bytecode version" is not quite correct, and because that's what the YoYo Runner calls it under the hood.
+
+Versions before GameMaker: Studio 1.0.198 (that is, pre-WAD version 8) uses raw GML code interpreted on load, so these versions would require a GML compiler to be supported in Butterscotch.
 
 However, that doesn't mean that a game that uses a compatible version WILL run! The bytecode support is still a WIP, and Butterscotch may have quirks that the original GameMaker: Studio runner may not have.
 
